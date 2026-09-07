@@ -47,8 +47,9 @@ catches those.
 
 ## Releasing
 
-Maintainers only. Publishing runs from CI, because `publishConfig.provenance` requires an OIDC
-token that only a workflow can supply:
+Maintainers only. Publishing runs from CI and there is no npm token anywhere: the registry trusts
+this repository and this workflow file directly, over the same OIDC handshake that signs the
+provenance attestation.
 
 1. Bump `version` in `package.json` and move the changelog heading.
 2. Create a GitHub release tagged `v<version>`.

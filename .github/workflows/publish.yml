@@ -1,9 +1,15 @@
 name: Publish
 
 # Publishing happens HERE and not from a laptop, and that is not a preference.
-# `publishConfig.provenance` is true, which makes npm record a signed statement of which commit in
-# which repo produced the tarball — and it can only do that from CI, where GitHub will vouch for
-# the run with an OIDC token. `npm publish` from a workstation with that flag set fails outright.
+#
+# There is no npm token. The registry is configured to trust THIS repository and THIS workflow
+# file, and GitHub hands the job a short-lived OIDC token that proves both — the same handshake
+# that signs the provenance attestation. Nothing long-lived exists to leak, rotate, or be blocked
+# by an account's two-factor policy, which is what a stored token runs into the moment 2FA covers
+# writes.
+#
+# Changing the filename of this workflow breaks publishing until the trusted publisher on
+# npmjs.com is updated to match, because the name is half of what npm is trusting.
 on:
   release:
     types: [published]
@@ -16,7 +22,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # required for provenance; without it the publish is refused
+  id-token: write # the OIDC token npm exchanges for publish rights; without it there is no auth at all
 
 jobs:
   publish:
@@ -25,12 +31,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Node 22, not 18: `prepublishOnly` runs `test:bundlers`, and Vite, webpack and rspack all
+      # Node 24, not 18: `prepublishOnly` runs `test:bundlers`, and Vite, webpack and rspack all
       # need 20.19+. On 18 the publish aborts inside its own gate.
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs npm 11.5.1 or newer. Node 24 ships npm 11, but pinning the tool
+      # rather than inheriting whatever the runner image happens to bundle keeps a runner update
+      # from quietly turning this back into "no token, no auth, no publish".
+      - run: npm install -g npm@latest
 
       - run: npm ci
 
@@ -49,9 +60,9 @@ jobs:
           echo "publishing $manifest"
 
       # `prepack` builds, `prepublishOnly` runs both suites. Nothing is uploaded until they pass.
-      - run: npm publish --provenance --tag "${{ inputs.tag || 'latest' }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # No `env:` block — the OIDC token is exchanged by npm itself. Provenance comes with trusted
+      # publishing, so `--provenance` is redundant here and `publishConfig` keeps asserting it.
+      - run: npm publish --tag "${{ inputs.tag || 'latest' }}"
 
       - name: prove it is installable
         run: |
