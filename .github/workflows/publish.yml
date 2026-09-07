@@ -1,0 +1,62 @@
+name: Publish
+
+# Publishing happens HERE and not from a laptop, and that is not a preference.
+# `publishConfig.provenance` is true, which makes npm record a signed statement of which commit in
+# which repo produced the tarball — and it can only do that from CI, where GitHub will vouch for
+# the run with an OIDC token. `npm publish` from a workstation with that flag set fails outright.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'npm dist-tag (use "next" for a prerelease)'
+        required: false
+        default: latest
+
+permissions:
+  contents: read
+  id-token: write # required for provenance; without it the publish is refused
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 22, not 18: `prepublishOnly` runs `test:bundlers`, and Vite, webpack and rspack all
+      # need 20.19+. On 18 the publish aborts inside its own gate.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: npm ci
+
+      # A tag that disagrees with package.json publishes a version nobody asked for, under a name
+      # nobody will look for. npm would accept it happily, and the version can never be replaced.
+      - name: the tag and package.json must agree
+        if: github.event_name == 'release'
+        run: |
+          set -e
+          manifest=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "release tag v$tag does not match package.json $manifest" >&2
+            exit 1
+          fi
+          echo "publishing $manifest"
+
+      # `prepack` builds, `prepublishOnly` runs both suites. Nothing is uploaded until they pass.
+      - run: npm publish --provenance --tag "${{ inputs.tag || 'latest' }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: prove it is installable
+        run: |
+          set -e
+          cd "$(mktemp -d)"
+          npm init -y > /dev/null
+          npm install "@vinktarhq/cli@$(node -p "require('$GITHUB_WORKSPACE/package.json').version")"
+          ./node_modules/.bin/vinktar --version

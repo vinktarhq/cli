@@ -1,0 +1,6 @@
+/node_modules/
+/dist/
+*.tsbuildinfo
+
+# npm pack output, produced by the pre-publish install test.
+*.tgz

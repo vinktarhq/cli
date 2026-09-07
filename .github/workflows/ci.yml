@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Everything that runs on the Node floor the package actually promises: unit tests, a local HTTP
+  # server, and the two bundlers (rollup, esbuild) that still support Node 18.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22', '24']
+    name: test (node ${{ matrix.node }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}' }
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm test
+
+  # Real builds through Vite, webpack and rspack. Separate because of Node, not duration: each of
+  # them needs 20.19 or newer, and a fixture's requirement must not become the package's.
+  bundlers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    name: bundlers (node ${{ matrix.node }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}' }
+      - run: npm install
+      - run: npm run test:bundlers
+
+  # The package as PUBLISHED, not as a source tree. `npm test` imports from `src/`, so it can pass
+  # while the tarball is unusable — an export map that forgot its `require` condition, a `files`
+  # list that ships no `dist`, a missing shebang. Only installing the real thing catches those.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: tarball
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm install
+      - name: install it somewhere else and use it
+        run: |
+          set -e
+          # `npm pack` prints the filename it wrote, so ask it rather than guessing the glob.
+          # A hardcoded one silently stops matching the day the package is renamed, and then this
+          # job fails on the filename instead of on anything it was meant to be testing.
+          # `prepack` builds; this tarball is exactly what would be published.
+          tarball="$PWD/$(npm pack --silent | tail -1)"
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y > /dev/null
+          npm install "$tarball"
+          ./node_modules/.bin/vinktar --version
+          node -e "const {vinktarWebpack}=require('@vinktarhq/cli/webpack'); if(typeof vinktarWebpack!=='function') process.exit(1)"
+          node -e "const {vinktarRspack}=require('@vinktarhq/cli/rspack'); if(typeof vinktarRspack!=='function') process.exit(1)"
+          node --input-type=module -e "const m=await import('@vinktarhq/cli/vite'); if(typeof m.vinktar!=='function') process.exit(1)"
+          node --input-type=module -e "const m=await import('@vinktarhq/cli'); if(typeof m.upload!=='function') process.exit(1)"
