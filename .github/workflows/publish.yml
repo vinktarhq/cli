@@ -69,5 +69,12 @@ jobs:
           set -e
           cd "$(mktemp -d)"
           npm init -y > /dev/null
-          npm install "@vinktarhq/cli@$(node -p "require('$GITHUB_WORKSPACE/package.json').version")"
+          version=$(node -p "require('$GITHUB_WORKSPACE/package.json').version")
+          # A new version takes a minute or two to reach the registry's read side after publishing,
+          # so a first "no matching version" is not a failed release. Give it fifteen minutes.
+          for attempt in $(seq 1 60); do
+            if npm install --prefer-online "@vinktarhq/cli@$version" > /dev/null 2>&1; then break; fi
+            [ "$attempt" = 60 ] && { echo "@vinktarhq/cli@$version was not installable after fifteen minutes" >&2; exit 1; }
+            sleep 15
+          done
           ./node_modules/.bin/vinktar --version
