@@ -1,8 +1,9 @@
+import { createServer, type Server } from 'node:http';
 import { mkdtemp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { existingDebugId, REGISTRY_GLOBAL } from '../src/debug-id.js';
 import { vinktarRollup } from '../src/bundler/rollup.js';
@@ -20,8 +21,29 @@ import { vinktarEsbuild } from '../src/bundler/esbuild.js';
  * webpack and rspack need Node 20.19 or newer, so their fixtures are in `test/bundlers/` and run
  * on a narrower matrix — see `test:bundlers`.
  *
- * Uploads are off throughout: `uploadSourcemaps: false` keeps every one of these offline.
+ * Uploads are off for the stamping tests: `uploadSourcemaps: false` keeps those offline. The
+ * outage tests at the bottom talk to a local server and nothing else.
  */
+
+/**
+ * An ingest that answers 500 to everything, which is what an outage looks like from a build.
+ */
+async function down(): Promise<{ host: string; close(): Promise<void> }> {
+  const server: Server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => response.writeHead(500).end('{}'));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  return {
+    host: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
 
 async function project(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'vinktar-bundlers-'));
@@ -191,6 +213,95 @@ describe('the bundler plugins', () => {
       };
 
       expectShifted(await maps(await build(true, 'ewith')), await maps(await build(false, 'ewithout')));
+    },
+    60_000,
+  );
+});
+
+/**
+ * The same outage through a whole build, because "the hook did not throw" is a claim about the
+ * bundler as much as about the plugin: Rollup fails a build on a rejected `writeBundle`, esbuild on
+ * a rejected `onEnd`.
+ */
+describe('a build while ingest is down', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it(
+    'finishes under rollup, with the maps still in the output and a warning',
+    async () => {
+      const root = await project();
+      const server = await down();
+      const warnings: string[] = [];
+      vi.spyOn(console, 'warn').mockImplementation((line: string) => void warnings.push(line));
+      const { rollup } = await import('rollup');
+
+      try {
+        const build = await rollup({
+          input: join(root, 'src/main.js'),
+          plugins: [vinktarRollup({ key: 'vnk_sk_cli', host: server.host, release: 'r1', silent: true })],
+        });
+        await build.write({ dir: join(root, 'dist'), format: 'es', sourcemap: 'hidden' });
+        await build.close();
+      } finally {
+        await server.close();
+      }
+
+      expect(Object.keys(await maps(join(root, 'dist')))).toEqual(['main.js.map']);
+      expect(warnings.join('\n')).toContain('source-map upload failed');
+    },
+    60_000,
+  );
+
+  it(
+    'fails under rollup when strict asks for that',
+    async () => {
+      const root = await project();
+      const server = await down();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { rollup } = await import('rollup');
+
+      try {
+        const build = await rollup({
+          input: join(root, 'src/main.js'),
+          plugins: [vinktarRollup({ key: 'vnk_sk_cli', host: server.host, release: 'r1', silent: true, strict: true })],
+        });
+        await expect(build.write({ dir: join(root, 'dist'), format: 'es', sourcemap: 'hidden' })).rejects.toThrow(
+          /source-map upload failed/,
+        );
+        await build.close();
+      } finally {
+        await server.close();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'finishes under esbuild, with the maps still in the output and a warning',
+    async () => {
+      const root = await project();
+      const server = await down();
+      const warnings: string[] = [];
+      vi.spyOn(console, 'warn').mockImplementation((line: string) => void warnings.push(line));
+      const esbuild = await import('esbuild');
+
+      try {
+        const result = await esbuild.build({
+          entryPoints: [join(root, 'src/main.js')],
+          bundle: true,
+          format: 'esm',
+          sourcemap: true,
+          metafile: true,
+          outdir: join(root, 'dist'),
+          plugins: [vinktarEsbuild({ key: 'vnk_sk_cli', host: server.host, release: 'r1', silent: true })],
+        });
+        expect(result.errors).toEqual([]);
+      } finally {
+        await server.close();
+      }
+
+      expect(Object.keys(await maps(join(root, 'dist')))).toEqual(['main.js.map']);
+      expect(warnings.join('\n')).toContain('source-map upload failed');
     },
     60_000,
   );

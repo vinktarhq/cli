@@ -163,7 +163,7 @@ rspack all have a hook that runs before hashing, so they have neither problem.
 vinktar({
   urlPrefix: '/assets/',
   deleteSourcemapsAfterUpload: true,
-  errorHandler: (error) => { throw error; },
+  strict: true, // fail the build when the upload fails. Off by default
 });
 ```
 
@@ -178,10 +178,15 @@ vinktar({
 | `deleteSourcemapsAfterUpload` | `true` | Remove the maps from the build output afterwards |
 | `injectDebugIds` | `true` | `false` uploads without modifying any chunk, for strict CSP/SRI builds |
 | `disable` | `false` | Return a no-op plugin before any env, git or network work |
-| `errorHandler` | — | Called instead of failing. Throw from it to fail the build |
+| `strict` | `false`, or `$VINKTAR_STRICT` | Fail the build when the upload fails. Without it a failed upload is a warning |
+| `errorHandler` | — | Called with the failure instead of the warning, or of the throw under `strict`. Throw from it to fail the build |
+| `timeoutMs` | `30000` | Per request, before an allowance for the size of the body |
+| `maxRetries` | `3` | Attempts per request, including the first |
+| `concurrency` | `4`, or what the server asks | Requests in flight |
+| `deadlineMs` | `300000` | For the whole upload. Past it, what is left is abandoned and the upload counts as failed |
 | `silent` | `false` | Suppress the plugin's own output. Warnings are never silenced |
 
-### Two defaults worth knowing about
+### Three defaults worth knowing about
 
 **Maps are deleted from your build output.** A source map is your original source; the bundler only
 emitted one because this plugin asked it to, so leaving it in a public directory publishes your
@@ -190,9 +195,20 @@ mean to serve them.
 
 **A missing key warns, it does not fail.** A contributor running `npm run build` with no key gets a
 loud warning naming the consequence — and the maps are still deleted, because "the CI secret was
-never wired up" must not become "we shipped our source". If the upload is *attempted* and fails
-while deletion is on, that **does** fail the build: there is no second chance once the maps are
-gone. Pass an `errorHandler` to opt back into warn-only.
+never wired up" must not become "we shipped our source".
+
+**A failed upload warns, it does not fail either.** Vinktar being down, a revoked key, a full
+quota, a checkout with no git to read a release from, a map that is not JSON: none of those is a
+reason for your deploy to stop, so the plugin prints what went wrong, with the hint, and the build
+finishes. Every request is bounded and so is the whole upload (`deadlineMs`, five minutes), so it
+cannot hold the build either.
+
+What it does not do after a failed upload is delete the maps. They are the only copy, and
+`sourcemaps upload` on the same directory can still send them. That leaves your source in the
+output directory, and **a deploy that publishes that directory as it stands publishes them** — the
+warning says so, with the path. If you would rather not ship than ship like that, set
+`strict: true`, or `VINKTAR_STRICT=1` in the pipeline, and a failed upload fails the build as it
+used to. An `errorHandler`, if you pass one, is called instead of either.
 
 ---
 
@@ -231,14 +247,13 @@ unset `TAG` is a release named nothing, not no release.
 | `--no-inject` | Upload without stamping. Those chunks match by release + url only |
 | `--no-rewrite-sources` | Send `sources` exactly as the bundler wrote them |
 | `--dry-run` | Print what would be uploaded. Sends nothing, needs no key |
-| `--strict` | Treat any warning as a failure (exit 2) |
-| `--allow-failure` | Never exit non-zero because the upload failed |
+| `--strict` | Forgive nothing: a failed upload exits 1, warnings exit 2. Also `$VINKTAR_STRICT` |
+| `--allow-failure` | Accepted and ignored; it is the default now. `--strict` wins if both are given |
 | `--concurrency` `--timeout` `--retries` | Request shaping |
+| `--deadline <s>` | For the whole upload. Default 300. Past it, what is left is abandoned |
 | `--header 'Name: value'` | For a gateway in front of ingest. Repeatable |
 | `--dotenv-file <path>` | Read `VINKTAR_*` from a file. Ranks below the real environment |
 | `--quiet` `--debug` | How much it says. `--debug` redacts the key |
-
-Exit codes: `0` fine, `1` it did not work, `2` it worked and `--strict` found something anyway.
 
 </details>
 
@@ -248,6 +263,36 @@ Exit codes: `0` fine, `1` it did not work, `2` it worked and `--strict` found so
 npm run build
 npx @vinktarhq/cli sourcemaps upload ./dist --release "$GITHUB_SHA"
 ```
+
+That line cannot fail your deploy. If the upload does not work — Vinktar is down, the key was
+revoked, the secret never reached the job, `./dist` is not there, a map is not JSON — it says so
+on stderr, starting with a line you can search your logs for, and exits 0:
+
+```
+WARNING: source maps were not uploaded.
+The write key was rejected.
+Check --key, or the VINKTAR_CLI_KEY environment variable.
+```
+
+It also cannot hold the deploy: every request has a timeout and the whole upload has a deadline
+(`--deadline`, five minutes), after which the rest is abandoned.
+
+Add `--strict`, or set `VINKTAR_STRICT=1`, if you would rather the step failed. It means the same
+thing everywhere: nothing is forgiven.
+
+| Exit code | |
+|---|---|
+| `0` | Fine. For `sourcemaps upload`, also: the upload failed, stderr says why, and the deploy carries on |
+| `1` | It did not work. `sourcemaps upload` only says so under `--strict`; every other command always does |
+| `2` | It worked, and `--strict` found warnings: chunks without maps, without debug ids, oversized or duplicated |
+
+One kind of failure is `1` with or without `--strict`: a command that was written wrong. An unknown
+command, `--timeout soon`, a `--header` with no colon, a `--host` that is not a
+URL, no directory at all. Those fail the same way on every run, so a typo in a CI script is found
+on the first one instead of never. A value that *arrived* wrong is not that: `--release "$TAG"`
+with `TAG` unset, or an empty key, belongs to this run's environment and is treated like any other
+failed upload. An unknown flag sits between the two: it is `1` everywhere except on `sourcemaps
+upload` without `--strict`, where it used to be ignored and is now a warning on stderr.
 
 `--release` must match what your SDK reports. If they differ the upload succeeds and never matches
 a single frame — which is why the Vite plugin defines the release into your bundle for you.
@@ -285,7 +330,9 @@ reads `vinktar tools` and runs `vinktar call`.
 | `VINKTAR_DIST` | Build discriminator |
 | `VINKTAR_IGNORE` | Comma-separated globs |
 | `VINKTAR_DISABLE` | `1` turns the plugin into a no-op |
-| `VINKTAR_UPLOAD_CONCURRENCY`, `VINKTAR_HTTP_TIMEOUT`, `VINKTAR_HTTP_MAX_RETRIES` | Request shaping |
+| `VINKTAR_STRICT` | `1` makes a failed upload fail: the build, for a plugin; exit 1, for `sourcemaps upload` |
+| `VINKTAR_UPLOAD_CONCURRENCY`, `VINKTAR_HTTP_TIMEOUT`, `VINKTAR_HTTP_MAX_RETRIES`, `VINKTAR_UPLOAD_DEADLINE` | Request shaping, read by the CLI and the plugins. Timeout and deadline are in seconds |
+| `VINKTAR_ALLOW_FAILURE` | Accepted and ignored; not failing is the default now |
 | `VINKTAR_QUIET`, `VINKTAR_DEBUG`, `VINKTAR_LOG_LEVEL` | Output |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | Honoured over a CONNECT tunnel — Node's own `fetch` ignores these, so without it a corporate network gives you `ECONNREFUSED` from a tool that works everywhere else |
 

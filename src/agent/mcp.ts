@@ -1,3 +1,4 @@
+import { bounded } from './net.js';
 import { OAuthError, refresh } from './oauth.js';
 import { load, save, type Session } from './store.js';
 
@@ -35,11 +36,11 @@ export class McpClient {
   constructor(
     private readonly url: string,
     private session: Session,
-    private readonly fetcher: Fetch = fetch,
+    private readonly fetcher: Fetch = bounded(),
     private readonly credentials?: string,
   ) {}
 
-  static async signedIn(url: string, fetcher: Fetch = fetch, credentials?: string): Promise<McpClient> {
+  static async signedIn(url: string, fetcher: Fetch = bounded(), credentials?: string): Promise<McpClient> {
     const { session } = await load(url, credentials);
     if (session === undefined) throw new McpError(`Not signed in to ${url}. Run: vinktar login`);
 

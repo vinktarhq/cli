@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased
+
+### A failed upload no longer fails your build
+
+This changes what happens by default, so read it before upgrading.
+
+Until now a bundler plugin threw when the upload failed and deletion was on, and
+`sourcemaps upload` exited 1 unless `--allow-failure` was passed. Either way an outage here, a
+revoked key or a full quota stopped somebody's deploy, over stack traces. Now:
+
+- **The plugins warn and let the build finish**, whatever went wrong: a 5xx, a timeout, a 429 that
+  outlasted its retries, a refused key, the wrong scope, a full quota, no release, a directory that
+  cannot be read, a map that is not JSON. The warning carries the same message and hint as before.
+- **The maps of a failed upload are not deleted**, even with `deleteSourcemapsAfterUpload` on. They
+  are the only copy. The warning names the directory and says that a deploy which publishes it
+  publishes them. This also holds when an `errorHandler` is given, where they used to be deleted.
+- **`strict: true`, or `VINKTAR_STRICT=1`, restores failing the build.** `errorHandler` still takes
+  precedence over both.
+- **`sourcemaps upload` exits 0 when the upload fails**, including for a missing key or release, an
+  empty `--release`, a missing `--dotenv-file`, an unreadable directory, a broken map and a build
+  with no maps at all, none of which `--allow-failure` used to cover. stderr starts with
+  `WARNING: source maps were not uploaded.` so the deploys that went out without maps can be found.
+  `--strict`, or `VINKTAR_STRICT=1`, makes it exit 1.
+- `--strict` now has one meaning everywhere, nothing is forgiven: a failed upload exits 1, and
+  warnings from an upload or an inject that worked still exit 2. `sourcemaps inject` is unchanged.
+- `--allow-failure` and `VINKTAR_ALLOW_FAILURE` are accepted and ignored, so existing pipelines keep
+  running. `--strict` wins when both are given.
+- A command that was written wrong always exits 1: an unknown command, a value that does not parse,
+  and, new in this release, **an unknown flag**, which used to be ignored. The exception is
+  `sourcemaps upload` without `--strict`, which prints `WARNING: unknown flag …, ignored` and
+  carries on, so a stray flag in a deploy that worked yesterday does not stop it today. Read the
+  warning: `--strcit` is a pipeline that believes it is strict.
+- The plugins check for an empty release before sending anything, instead of relaying the server's
+  `missing_release` and its hint about CLI flags.
+
+### Nothing waits for ever
+
+- A whole upload has a deadline: `--deadline <s>`, `VINKTAR_UPLOAD_DEADLINE`, or `deadlineMs`, five
+  minutes by default, covering the pre-flight, every batch and every retry. Past it the requests in
+  flight are aborted and the upload counts as failed. `upload()` also takes a `signal`.
+- Once one batch has failed for good, no further batch starts and the ones in flight are aborted.
+  The other runners used to work through the rest of the list, retries and all, before the failure
+  was reported.
+- The plugins take `timeoutMs`, `maxRetries`, `concurrency` and `deadlineMs`, and read the same
+  variables as the CLI. They passed none of them before.
+- Behind a proxy the request timeout measured the gap between two bytes, so a proxy that dripped a
+  response never tripped it. It bounds the whole request now, as it does without a proxy, and a
+  timed-out request is retried like any other transient failure on both paths.
+- Every request made by `login`, `logout`, `tools`, `call` and the shortcuts has a 30 second
+  timeout, and `doctor`'s key check has the 10 seconds its health check already had. The five
+  minute wait for the browser in `login` is separate and unchanged.
+
+### Fixes
+
+- `doctor` reported `Ready to upload.` and exited 0 for any answer that was not a 401 or
+  `cli_scope_required`, a 500, 502 or 429 included. It now says ready only on the answer that
+  proves it, reports a server error or throttling with the status, and exits 1.
+- A network failure in an agent command printed `fetch failed`. It now names the server and the
+  cause, such as `connect ECONNREFUSED 127.0.0.1:8443`. The upload path names the cause too.
+- Malformed `--args` printed the JSON parser's message. It now says that `--args` is not valid JSON
+  and what it takes.
+- `vinktar call` with no tool, and `vinktar sql` with no query, said `Not signed in` when run
+  signed out. Arguments are checked first.
+- A stream error other than `EPIPE` was rethrown from the handler and printed a stack trace. It
+  prints one line and exits 1.
+
 ## 0.2.0
 
 ### Agents without MCP

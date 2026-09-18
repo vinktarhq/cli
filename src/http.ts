@@ -22,6 +22,8 @@ export interface RequestOptions {
   readonly headers?: Readonly<Record<string, string>>;
   /** Whole-request deadline. Callers scale it for large bodies. */
   readonly timeoutMs: number;
+  /** Abandons the request when it fires, with the signal's reason as the error. */
+  readonly signal?: AbortSignal;
   /** Appended to the User-Agent, e.g. `vite-plugin/0.1.0`. */
   readonly plugin?: string;
   readonly env?: Record<string, string | undefined>;
@@ -52,19 +54,53 @@ export async function send(options: RequestOptions): Promise<Reply> {
     ...options.headers,
   };
 
-  const proxy = proxyFor(options.url, options.env ?? process.env);
-  if (proxy !== null) return throughProxy(proxy, options, headers);
+  const bound = within(options.timeoutMs, options.signal);
 
-  const response = await fetch(options.url, {
-    method: options.method,
-    headers,
-    ...(options.body === undefined ? {} : { body: options.body }),
-    signal: AbortSignal.timeout(options.timeoutMs),
-  });
+  try {
+    const proxy = proxyFor(options.url, options.env ?? process.env);
+    if (proxy !== null) return await throughProxy(proxy, options, headers, bound.signal);
 
-  const text = await response.text();
+    const response = await fetch(options.url, {
+      method: options.method,
+      headers,
+      ...(options.body === undefined ? {} : { body: options.body }),
+      signal: bound.signal,
+    });
 
-  return { status: response.status, text, header: (name) => response.headers.get(name) };
+    const text = await response.text();
+
+    return { status: response.status, text, header: (name) => response.headers.get(name) };
+  } finally {
+    bound.clear();
+  }
+}
+
+/**
+ * One signal for "this request has had long enough" and "the caller has given up".
+ *
+ * A timer rather than `AbortSignal.timeout`, for two reasons. Both paths get the same error, worded
+ * so that {@link retriable} recognises it; and the caller's signal can be folded in without
+ * `AbortSignal.any`, which Node 18 does not have.
+ */
+function within(timeoutMs: number, outer?: AbortSignal): { signal: AbortSignal; clear(): void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`timed out after ${timeoutMs} ms`)), timeoutMs);
+  const forward = (): void => controller.abort(outer?.reason);
+
+  if (outer?.aborted === true) forward();
+  else outer?.addEventListener('abort', forward, { once: true });
+
+  return {
+    signal: controller.signal,
+    clear: () => {
+      clearTimeout(timer);
+      outer?.removeEventListener('abort', forward);
+    },
+  };
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? 'aborted'));
 }
 
 /**
@@ -117,10 +153,11 @@ async function throughProxy(
   proxy: URL,
   options: RequestOptions,
   headers: Record<string, string>,
+  signal: AbortSignal,
 ): Promise<Reply> {
   const target = new URL(options.url);
   const secure = target.protocol === 'https:';
-  const socket = secure ? await tunnel(proxy, target, options.timeoutMs) : null;
+  const socket = secure ? await tunnel(proxy, target, options.timeoutMs, signal) : null;
 
   return new Promise<Reply>((resolve, reject) => {
     const perform = secure ? httpsRequest : httpRequest;
@@ -133,7 +170,6 @@ async function throughProxy(
             path: `${target.pathname}${target.search}`,
             headers,
             createConnection: () => socket!,
-            timeout: options.timeoutMs,
           }
         : {
             method: options.method,
@@ -142,11 +178,11 @@ async function throughProxy(
             // Absolute URI: the proxy needs to know where this is going, since there is no tunnel.
             path: options.url,
             headers: { ...headers, Host: target.host, ...proxyAuth(proxy) },
-            timeout: options.timeoutMs,
           },
       (response) => {
         const chunks: Buffer[] = [];
         response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('error', reject);
         response.on('end', () =>
           resolve({
             status: response.statusCode ?? 0,
@@ -161,7 +197,18 @@ async function throughProxy(
       },
     );
 
-    request.on('timeout', () => request.destroy(new Error(`timed out after ${options.timeoutMs} ms`)));
+    // The deadline is for the whole exchange. The `timeout` option of `http.request` is not: it
+    // measures the gap between two bytes, so a proxy that answers one byte at a time never trips
+    // it, and an upload could sit here for as long as the proxy cared to keep the socket warm.
+    const abandon = (): void => {
+      // Rejected here rather than from the `error` event: once the response has started, the
+      // error Node reports for a destroyed socket is its own "aborted", not the reason.
+      reject(abortReason(signal));
+      request.destroy();
+    };
+    if (signal.aborted) abandon();
+    else signal.addEventListener('abort', abandon, { once: true });
+
     request.on('error', reject);
     if (options.body !== undefined) request.write(options.body);
     request.end();
@@ -177,7 +224,7 @@ function proxyAuth(proxy: URL): Record<string, string> {
 }
 
 /** Open a CONNECT tunnel to the target, over which TLS is then negotiated end to end. */
-async function tunnel(proxy: URL, target: URL, timeoutMs: number): Promise<Socket> {
+async function tunnel(proxy: URL, target: URL, timeoutMs: number, signal: AbortSignal): Promise<Socket> {
   return new Promise<Socket>((resolve, reject) => {
     const port = proxy.port === '' ? (proxy.protocol === 'https:' ? 443 : 80) : Number(proxy.port);
     const host = `${target.hostname}:${target.port === '' ? 443 : target.port}`;
@@ -196,6 +243,14 @@ async function tunnel(proxy: URL, target: URL, timeoutMs: number): Promise<Socke
       reject(new Error(`the proxy at ${proxy.host} did not answer within ${timeoutMs} ms`));
     });
     client.once('error', reject);
+    signal.addEventListener(
+      'abort',
+      () => {
+        client.destroy();
+        reject(abortReason(signal));
+      },
+      { once: true },
+    );
     client.once('data', (chunk: Buffer) => {
       const status = Number(/^HTTP\/1\.[01] (\d{3})/.exec(chunk.toString('latin1'))?.[1] ?? 0);
       if (status === 200) {
@@ -239,6 +294,26 @@ export function retriable(error: unknown, isDefaultHost: boolean): boolean {
   if (RETRIABLE_CODES.has(code)) return true;
 
   return error instanceof Error && /terminated|fetch failed|timed out|socket hang up/i.test(error.message);
+}
+
+/**
+ * Why a request failed, in words worth printing.
+ *
+ * `fetch` rejects with the two words "fetch failed" whatever went wrong, and puts the reason — the
+ * name that did not resolve, the port that refused — on `cause`. Newer Node versions wrap a refused
+ * connection once more, in an `AggregateError` with an empty message and one error per address.
+ */
+export function reason(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+
+  const cause: unknown = error.cause;
+  if (!(cause instanceof Error)) return error.message;
+
+  const inner = cause instanceof AggregateError && cause.errors[0] instanceof Error ? cause.errors[0] : cause;
+  const code = (cause as { code?: unknown }).code;
+  const detail = inner.message !== '' ? inner.message : typeof code === 'string' ? code : error.message;
+
+  return typeof code === 'string' && !detail.includes(code) ? `${detail} (${code})` : detail;
 }
 
 /**

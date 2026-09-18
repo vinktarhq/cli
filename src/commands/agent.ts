@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { DEFAULT_MCP_URL, McpClient, type Tool } from '../agent/mcp.js';
+import { bounded, REQUEST_TIMEOUT_MS } from '../agent/net.js';
 import { authorizeUrl, discover, exchange, listen, pkce, randomState, register, revoke } from '../agent/oauth.js';
 import { load, save } from '../agent/store.js';
 
@@ -22,6 +23,8 @@ export interface Io {
   readonly fail: (line: string) => void;
   readonly env: NodeJS.ProcessEnv;
   readonly fetcher?: typeof fetch;
+  /** Per request. Shortened in tests; 30 s otherwise. Not the wait for the browser in `login`. */
+  readonly timeoutMs?: number;
   /** Replaced in tests; opens the system browser otherwise. */
   readonly open?: (url: string) => void;
   readonly credentials?: string;
@@ -64,7 +67,16 @@ function openBrowser(url: string): void {
 export function toolArguments(pairs: readonly string[], json: string | undefined): Record<string, unknown> {
   let args: Record<string, unknown> = {};
   if (json !== undefined && json !== '') {
-    const parsed: unknown = JSON.parse(json);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json);
+    } catch (error) {
+      // The parser's own message is a position in a string the person cannot see the way the
+      // shell delivered it. Naming the flag and the shape is what gets it fixed.
+      throw new Error(
+        `--args is not valid JSON (${error instanceof Error ? error.message : String(error)}). It takes one object, like --args '{"limit":10}'.`,
+      );
+    }
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('--args must be a JSON object.');
     args = { ...(parsed as Record<string, unknown>) };
   }
@@ -114,7 +126,7 @@ export async function runAgent(
   io: Io,
 ): Promise<number> {
   const url = mcpUrl(flags, io.env);
-  const fetcher = io.fetcher ?? fetch;
+  const fetcher = bounded(io.fetcher ?? fetch, io.timeoutMs ?? REQUEST_TIMEOUT_MS);
   const project = typeof flags.get('project') === 'string' ? (flags.get('project') as string) : undefined;
   const withProject = (args: Record<string, unknown>): Record<string, unknown> =>
     project === undefined ? args : { project, ...args };
@@ -160,6 +172,34 @@ export async function runAgent(
     return 0;
   }
 
+  const shortcuts: Record<string, () => [string, Record<string, unknown>]> = {
+    guide: () => ['get_install_guide', {}],
+    keys: () => ['get_project_keys', withProject({})],
+    status: () => ['get_setup_status', withProject({})],
+    changes: () => {
+      const last = flags.get('last');
+
+      return ['whats_changed', withProject(typeof last === 'string' ? { last } : {})];
+    },
+    sql: () => {
+      const query = positional[1];
+      if (query === undefined) throw new Error('Give the query: vinktar sql "SELECT event_name, count() FROM events GROUP BY event_name"');
+
+      return ['run_sql', withProject({ query })];
+    },
+    call: () => {
+      const name = positional[1];
+      if (name === undefined) throw new Error('Name the tool: vinktar call <tool> key=value … (vinktar tools lists them).');
+      const json = flags.get('args');
+
+      return [name, withProject(toolArguments(positional.slice(2), typeof json === 'string' ? json : undefined))];
+    },
+  };
+
+  // Worked out before the sign-in is checked. `vinktar call` with no tool is wrong whoever runs it,
+  // and answering "Not signed in" sends an agent to a browser over an argument it left out.
+  const planned = shortcuts[command]?.();
+
   const client = await McpClient.signedIn(url, fetcher, io.credentials);
 
   if (command === 'tools') {
@@ -192,31 +232,7 @@ export async function runAgent(
     return 0;
   }
 
-  const shortcuts: Record<string, () => [string, Record<string, unknown>]> = {
-    guide: () => ['get_install_guide', {}],
-    keys: () => ['get_project_keys', withProject({})],
-    status: () => ['get_setup_status', withProject({})],
-    changes: () => {
-      const last = flags.get('last');
-
-      return ['whats_changed', withProject(typeof last === 'string' ? { last } : {})];
-    },
-    sql: () => {
-      const query = positional[1];
-      if (query === undefined) throw new Error('Give the query: vinktar sql "SELECT event_name, count() FROM events GROUP BY event_name"');
-
-      return ['run_sql', withProject({ query })];
-    },
-    call: () => {
-      const name = positional[1];
-      if (name === undefined) throw new Error('Name the tool: vinktar call <tool> key=value … (vinktar tools lists them).');
-      const json = flags.get('args');
-
-      return [name, withProject(toolArguments(positional.slice(2), typeof json === 'string' ? json : undefined))];
-    },
-  };
-
-  const [tool, args] = shortcuts[command]!();
+  const [tool, args] = planned!;
   const result = await client.call(tool, args);
   (result.isError ? io.fail : io.log)(result.text);
 

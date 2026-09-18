@@ -75,6 +75,20 @@ describe('refusing a value rather than guessing', () => {
     expect(from(['--concurrency', '8']).concurrency).toBe(8);
     // Seconds in, milliseconds out: nobody types a timeout in milliseconds.
     expect(from(['--timeout', '90']).timeoutMs).toBe(90_000);
+    expect(from(['--deadline', '120']).deadlineMs).toBe(120_000);
+    expect(from([], { VINKTAR_UPLOAD_DEADLINE: '45' }).deadlineMs).toBe(45_000);
+    expect(from([]).deadlineMs).toBeUndefined();
+  });
+
+  it('tells a command that was written wrong from a value that arrived wrong', () => {
+    // `--timeout soon` is a typo and fails the same way on every run. `--release "$TAG"` with no
+    // TAG is this run's environment, which is the kind of failure an upload is allowed to survive.
+    expect(from(['--timeout', 'soon']).usage).toHaveLength(1);
+    expect(from(['--header', 'no-colon']).usage).toHaveLength(1);
+    expect(from(['--host', 'in.vinktar.com']).usage).toHaveLength(1);
+    expect(from(['--release', '']).usage).toEqual([]);
+    expect(from(['--release', '']).errors).toHaveLength(1);
+    expect(from(['--key', ' ']).usage).toEqual([]);
   });
 });
 
@@ -112,6 +126,14 @@ describe('switches', () => {
     expect(from([], { VINKTAR_QUIET: 'yes' }).quiet).toBe(true);
     expect(from([], { VINKTAR_QUIET: 'no' }).quiet).toBe(false);
     expect(from([], { VINKTAR_ALLOW_FAILURE: '1' }).allowFailure).toBe(true);
+  });
+
+  it('reads strict from a flag or the environment, and lets it win over allow-failure', () => {
+    expect(from([]).strict).toBe(false);
+    expect(from(['--strict']).strict).toBe(true);
+    expect(from([], { VINKTAR_STRICT: '1' }).strict).toBe(true);
+    expect(from(['--no-strict'], { VINKTAR_STRICT: '1' }).strict).toBe(false);
+    expect(from(['--strict', '--allow-failure']).strict).toBe(true);
   });
 });
 
