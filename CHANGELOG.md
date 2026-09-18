@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.0
+
+### Agents without MCP
+
+Most coding agents reach Vinktar over MCP. Some can't — pi has no MCP on purpose, Aider and plain
+CI jobs don't speak it — so the CLI now makes the same connection for them.
+
+- `vinktar login` signs in in the browser with OAuth 2.1, PKCE and a loopback redirect: the same
+  consent screen an editor shows, where you pick the workspace, optionally one project, and read or
+  read and write. The client registers itself once and reuses the registration. The session is kept
+  in `~/.config/vinktar/credentials.json` (mode 0600, written by rename), refreshed before it
+  expires and once more on a 401, and `vinktar logout` revokes it.
+- `vinktar tools` lists every tool with whether it writes; `vinktar call <tool> key=value …` runs
+  one. Values are read as JSON when they parse, and `--args '{…}'` takes a whole object.
+- Shortcuts for the calls people make by hand: `guide`, `keys`, `status`, `changes`, `sql`.
+- `vinktar agents-md --write` puts the Vinktar block into `AGENTS.md` between its own markers,
+  replacing only what is between them, so the next agent in the repository knows it's there.
+
+There is no `ask`. Vinktar runs no model — the agent calling the CLI is the model, and it picks the
+tool.
+
+Every call counts, is rate limited and shows up on the project's AI agents page exactly as it would
+from an editor. Still zero runtime dependencies.
+
 ## 0.1.0
 
 First release.

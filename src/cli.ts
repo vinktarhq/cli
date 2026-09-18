@@ -1,4 +1,5 @@
 import { detectRelease } from './bundler/core.js';
+import { AGENT_COMMANDS, runAgent } from './commands/agent.js';
 import { doctor } from './commands/doctor.js';
 import { inject } from './commands/inject.js';
 import { resolvePosition } from './commands/resolve.js';
@@ -18,7 +19,7 @@ import { VERSION } from './version.js';
  */
 
 const USAGE = `
-vinktar — upload source maps so stack traces resolve to your original code
+vinktar — upload source maps, and reach Vinktar from agents that have no MCP
 
 Usage
   npx @vinktarhq/cli sourcemaps upload <dir> --release <release> [options]
@@ -26,7 +27,29 @@ Usage
   npx @vinktarhq/cli sourcemaps resolve <map> --line <n> --column <n>
   npx @vinktarhq/cli doctor [--dir <dir>] [options]
 
-Commands
+Agents (the same connection an editor makes over MCP, for harnesses without it)
+  login               Sign in in the browser; pick a workspace, a project, read
+                      or read and write. Remembered in ~/.config/vinktar.
+  logout              Sign out and revoke the connection.
+  tools [--json]      Every tool an agent can call, and what it does.
+  call <tool> k=v …   Call one. Values are JSON when they parse; --args '{…}'
+                      takes a whole object for anything nested.
+  guide               The install guide an agent follows to set Vinktar up.
+  keys                The project's public write key, and where the source-map
+                      key goes.
+  status              What has arrived, and the next step if anything is missing.
+  changes [--last 7d] What changed this window against the one before.
+  sql "<query>"       Run a read-only VinktarQL query.
+  agents-md [--write [file]]
+                      The block that tells the next agent Vinktar is here; with
+                      --write, put it in AGENTS.md (or the file named) between its
+                      own markers, leaving the rest of the file alone.
+
+  --project <p>       Which project, when the sign-in covered more than one.
+  --mcp <url>         Defaults to $VINKTAR_MCP_URL or https://mcp.vinktar.com/mcp.
+  --no-browser        Print the sign-in link instead of opening it.
+
+Source maps
   sourcemaps upload   Stamp each chunk with a debug id, then send the maps. Run
                       after your bundler, on every deploy.
   sourcemaps inject   Only the stamping. For pipelines that build on one machine
@@ -97,6 +120,8 @@ const REPEATABLE = new Set(['ignore', 'header']);
 
 /** Flags that are switches. Everything else takes the next token as its value. */
 const BOOLEAN_FLAGS = new Set([
+  'no-browser',
+  'json',
   'dry-run',
   'no-inject',
   'no-rewrite-sources',
@@ -200,6 +225,18 @@ export async function run(argv: readonly string[], log = console.log, fail = con
     log(USAGE.trim());
 
     return positional.length === 0 ? 1 : 0;
+  }
+
+  // The agent commands share nothing with the source-map configuration: no key, no release, no
+  // host. Dispatched before that configuration is resolved, so its errors cannot block them.
+  if (AGENT_COMMANDS.has(positional[0]!)) {
+    try {
+      return await runAgent(positional[0]!, positional, flags, { log, fail, env: process.env });
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+
+      return 1;
+    }
   }
 
   const dotenvPath = text(flags, 'dotenv-file');

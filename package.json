@@ -1,12 +1,14 @@
 {
   "name": "@vinktarhq/cli",
-  "version": "0.1.0",
-  "description": "Vinktar CLI: upload source maps so stack traces resolve to your original code.",
+  "version": "0.2.0",
+  "description": "Vinktar CLI: upload source maps, and reach Vinktar from coding agents that have no MCP support.",
   "keywords": [
     "vinktar",
     "sourcemaps",
     "error-tracking",
-    "cli"
+    "cli",
+    "mcp",
+    "agents"
   ],
   "homepage": "https://vinktar.com",
   "bugs": {

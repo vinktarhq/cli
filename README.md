@@ -36,6 +36,7 @@ line, so every dependency would be latency on every CI run.
 - [Bundler plugins](#bundler-plugins)
 - [Plugin options](#plugin-options)
 - [The CLI](#the-cli)
+- [For agents without MCP](#for-agents-without-mcp)
 - [Environment variables](#environment-variables)
 - [Stack traces still minified?](#stack-traces-still-minified)
 - [How it works](#how-it-works)
@@ -252,6 +253,27 @@ npx @vinktarhq/cli sourcemaps upload ./dist --release "$GITHUB_SHA"
 a single frame — which is why the Vite plugin defines the release into your bundle for you.
 
 ---
+
+## For agents without MCP
+
+Coding agents usually reach Vinktar over MCP. If yours can't — pi, Aider, a CI job, a shell script —
+the CLI makes the same connection:
+
+```bash
+npx @vinktarhq/cli login            # opens the browser; pick the workspace and project
+npx @vinktarhq/cli tools            # everything an agent can call
+npx @vinktarhq/cli call get_schema propertyKey=plan
+npx @vinktarhq/cli status           # what has arrived, and the next step
+npx @vinktarhq/cli sql "SELECT event_name, count() FROM events GROUP BY event_name"
+npx @vinktarhq/cli agents-md --write   # tell the next agent in this repo that Vinktar is here
+```
+
+It's the same sign-in and the same tools an editor gets, so the same limits apply and every call is
+logged on the project's AI agents page. `--project` picks a project when the sign-in covered
+several; `--mcp` or `$VINKTAR_MCP_URL` points it somewhere other than `https://mcp.vinktar.com/mcp`.
+
+There's no `ask "…"` command on purpose: Vinktar doesn't run a model. Your agent is the model — it
+reads `vinktar tools` and runs `vinktar call`.
 
 ## Environment variables
 
