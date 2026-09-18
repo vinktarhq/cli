@@ -1,7 +1,8 @@
+import { createServer, type Server } from 'node:http';
 import { mkdtemp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { existingDebugId, REGISTRY_GLOBAL } from '../../src/debug-id.js';
 import { vinktarWebpack } from '../../src/bundler/webpack.js';
@@ -12,6 +13,26 @@ import { vinktarWebpack } from '../../src/bundler/webpack.js';
  * In the slow suite: webpack 5.110 needs Node 20.19 or newer, and the fast suite still runs the
  * whole 18–24 matrix.
  */
+
+/**
+ * An ingest that answers 500 to everything, which is what an outage looks like from a build.
+ */
+async function down(): Promise<{ host: string; close(): Promise<void> }> {
+  const server: Server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => response.writeHead(500).end('{}'));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  return {
+    host: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
 
 async function project(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'vinktar-webpack-'));
@@ -174,6 +195,67 @@ describe('the webpack plugin', () => {
       // The map is corrected in the same `processAssets` stage as the chunk, from the same bytes:
       // a fix in a later hook would land after webpack had already hashed and written it.
       expectShifted(await maps(await build(true, 'wwith')), await maps(await build(false, 'wwithout')));
+    },
+    120_000,
+  );
+});
+
+describe('a webpack build while ingest is down', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const compile = async (root: string, host: string, strict: boolean): Promise<void> => {
+    const { default: webpack } = await import('webpack');
+
+    await new Promise<void>((resolve, reject) => {
+      webpack(
+        {
+          mode: 'production',
+          entry: join(root, 'src/main.js'),
+          devtool: 'hidden-source-map',
+          output: { path: join(root, 'dist'), filename: 'main.js' },
+          plugins: [new vinktarWebpack({ key: 'vnk_sk_cli', host, release: 'r1', silent: true, strict })],
+        },
+        (error, stats) => {
+          if (error) return reject(error);
+          if (stats?.hasErrors() === true) return reject(new Error(stats.toString()));
+          resolve();
+        },
+      );
+    });
+  };
+
+  it(
+    'finishes, with the maps still in the output and a warning',
+    async () => {
+      const root = await project();
+      const server = await down();
+      const warnings: string[] = [];
+      vi.spyOn(console, 'warn').mockImplementation((line: string) => void warnings.push(line));
+
+      try {
+        await compile(root, server.host, false);
+      } finally {
+        await server.close();
+      }
+
+      expect(Object.keys(await maps(join(root, 'dist')))).toEqual(['main.js.map']);
+      expect(warnings.join('\n')).toContain('source-map upload failed');
+    },
+    120_000,
+  );
+
+  it(
+    'fails when strict asks for that',
+    async () => {
+      const root = await project();
+      const server = await down();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        await expect(compile(root, server.host, true)).rejects.toThrow(/source-map upload failed/);
+      } finally {
+        await server.close();
+      }
     },
     120_000,
   );

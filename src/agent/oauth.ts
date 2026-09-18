@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { bounded, NetworkError } from './net.js';
 import type { Session } from './store.js';
 
 /**
@@ -47,13 +48,21 @@ async function json(response: Response, what: string): Promise<Record<string, un
 }
 
 /** The server's endpoints, from the resource metadata and then the authorization server's. */
-export async function discover(mcpUrl: string, fetcher: Fetch = fetch): Promise<Endpoints> {
+export async function discover(mcpUrl: string, fetcher: Fetch = bounded()): Promise<Endpoints> {
   const url = new URL(mcpUrl);
   let issuer = url.origin;
 
   // RFC 9728: the resource says which authorization server guards it. A server that predates it
-  // is its own authorization server, which is the fallback.
-  const resource = await fetcher(`${url.origin}/.well-known/oauth-protected-resource${url.pathname}`).catch(() => null);
+  // is its own authorization server, which is the fallback. That is a server answering 404, not a
+  // server that cannot be reached: asking the same host a second question would only be a second
+  // wait for the same failure.
+  const resource = await fetcher(`${url.origin}/.well-known/oauth-protected-resource${url.pathname}`).catch(
+    (error: unknown) => {
+      if (error instanceof NetworkError) throw error;
+
+      return null;
+    },
+  );
   if (resource?.ok) {
     const body = (await resource.json().catch(() => ({}))) as { authorization_servers?: unknown };
     const first = Array.isArray(body.authorization_servers) ? body.authorization_servers[0] : undefined;
@@ -82,7 +91,7 @@ export async function discover(mcpUrl: string, fetcher: Fetch = fetch): Promise<
  */
 export const REGISTERED_REDIRECT = 'http://127.0.0.1/callback';
 
-export async function register(endpoints: Endpoints, fetcher: Fetch = fetch): Promise<string> {
+export async function register(endpoints: Endpoints, fetcher: Fetch = bounded()): Promise<string> {
   if (endpoints.registration === null) throw new OAuthError('The server does not allow clients to register themselves.');
 
   const body = await json(
@@ -217,7 +226,7 @@ function toSession(body: Record<string, unknown>, clientId: string, endpoints: E
 export async function exchange(
   endpoints: Endpoints,
   params: { clientId: string; code: string; redirectUri: string; verifier: string; resource: string },
-  fetcher: Fetch = fetch,
+  fetcher: Fetch = bounded(),
 ): Promise<Session> {
   const body = await json(
     await fetcher(endpoints.token, {
@@ -238,7 +247,7 @@ export async function exchange(
   return toSession(body, params.clientId, endpoints, null);
 }
 
-export async function refresh(session: Session, resource: string, fetcher: Fetch = fetch): Promise<Session> {
+export async function refresh(session: Session, resource: string, fetcher: Fetch = bounded()): Promise<Session> {
   if (session.refreshToken === null) throw new OAuthError('The session has expired. Run vinktar login.');
 
   const body = await json(
@@ -268,7 +277,7 @@ export async function refresh(session: Session, resource: string, fetcher: Fetch
 }
 
 /** Best effort: signing out locally must work even when the server cannot be reached. */
-export async function revoke(session: Session, fetcher: Fetch = fetch): Promise<boolean> {
+export async function revoke(session: Session, fetcher: Fetch = bounded()): Promise<boolean> {
   if (session.revocationEndpoint === null) return false;
   const token = session.refreshToken ?? session.accessToken;
   const response = await fetcher(session.revocationEndpoint, {

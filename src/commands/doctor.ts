@@ -1,4 +1,6 @@
+import { reason } from '../http.js';
 import { DEFAULT_HOST, REQUIRED_SCOPE } from '../limits.js';
+import { seconds } from '../upload.js';
 import { audit } from './inject.js';
 
 export interface DoctorOptions {
@@ -6,7 +8,11 @@ export interface DoctorOptions {
   readonly dir?: string;
   readonly ignore?: readonly string[];
   readonly extensions?: readonly string[];
+  /** Per request. Default 10 s: this is a question asked at a terminal, not an upload. */
+  readonly timeoutMs?: number;
 }
+
+const TIMEOUT_MS = 10_000;
 
 /**
  * Answers "is this key going to work, and for what", and with `--dir`, "is this build stamped".
@@ -33,7 +39,8 @@ export async function doctor(
     log('');
   }
 
-  const health = await probe(`${host}/v1/health`);
+  const timeoutMs = options.timeoutMs ?? TIMEOUT_MS;
+  const health = await probe(`${host}/v1/health`, timeoutMs);
   log(health.ok ? 'reachable          yes' : `reachable          NO — ${health.detail}`);
   if (!health.ok) {
     log('');
@@ -45,16 +52,24 @@ export async function doctor(
   // An empty upload is the cheapest way to ask "would you accept this key". It never stores
   // anything: the server rejects it for a missing release long before it looks at any file.
   const form = new FormData();
-  const response = await fetch(`${host}/v1/sourcemaps`, {
-    method: 'POST',
-    headers: { 'X-Vinktar-Key': key },
-    body: form,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${host}/v1/sourcemaps`, {
+      method: 'POST',
+      headers: { 'X-Vinktar-Key': key },
+      body: form,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    log(`key accepted       unknown — ${unreachable(error, timeoutMs)}`);
+
+    return false;
+  }
 
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   const code = String(payload['error'] ?? '');
 
-  if (response.status === 401) {
+  if (response.status === 401 || code === 'invalid_api_key' || code === 'missing_api_key') {
     log('key accepted       NO — the key is unknown or revoked');
 
     return false;
@@ -70,7 +85,28 @@ export async function doctor(
     return false;
   }
 
-  // Reaching the release check means auth and scope both passed.
+  // The one answer that proves anything. The release is checked after the key and its scope, so
+  // being refused for the release means both passed. Every other answer is some other state, and
+  // reading "not a 401" as "accepted" is how a 502 from a proxy used to come out as ready.
+  if (code !== 'missing_release') {
+    const status = `HTTP ${response.status}`;
+    if (response.status === 429) {
+      log(`key accepted       unknown — throttled (${status})`);
+      log('');
+      log('The server is rate limiting this machine, so it never looked at the key. Wait a minute and run doctor again.');
+    } else if (response.status >= 500) {
+      log(`key accepted       unknown — server error (${status})`);
+      log('');
+      log('The server failed before it looked at the key. An upload now would fail the same way; try again shortly.');
+    } else {
+      log(`key accepted       unknown — unexpected answer (${status}${code === '' ? '' : `, ${code}`})`);
+      log('');
+      log('That is not what ingest answers to an empty upload. Check --host, and anything sitting in front of it.');
+    }
+
+    return false;
+  }
+
   log('key accepted       yes');
   log('upload scope       yes');
   log('');
@@ -160,12 +196,18 @@ async function checkBuild(
   return true;
 }
 
-async function probe(url: string): Promise<{ ok: boolean; detail: string }> {
+async function probe(url: string, timeoutMs: number): Promise<{ ok: boolean; detail: string }> {
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
 
     return { ok: response.ok, detail: `HTTP ${response.status}` };
   } catch (error) {
-    return { ok: false, detail: error instanceof Error ? error.message : 'unreachable' };
+    return { ok: false, detail: unreachable(error, timeoutMs) };
   }
+}
+
+function unreachable(error: unknown, timeoutMs: number): string {
+  return error instanceof Error && error.name === 'TimeoutError'
+    ? `did not answer within ${seconds(timeoutMs)}`
+    : reason(error);
 }

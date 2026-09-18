@@ -37,18 +37,35 @@ export interface Resolved {
   readonly concurrency: number | undefined;
   readonly timeoutMs: number | undefined;
   readonly maxRetries: number | undefined;
+  /** For a whole upload. Undefined leaves the default of five minutes. */
+  readonly deadlineMs: number | undefined;
   readonly headers: Record<string, string>;
   readonly ignore: string[];
   readonly extensions: string[] | undefined;
   readonly rewriteSources: boolean;
   readonly quiet: boolean;
   readonly debug: boolean;
+  /**
+   * Nothing is forgiven: a failed `sourcemaps upload` exits 1 instead of 0, and warnings from an
+   * upload or an inject that worked exit 2.
+   */
   readonly strict: boolean;
+  /**
+   * Read and then ignored. Not failing the pipeline is what `sourcemaps upload` does by default
+   * now, and the flag is still accepted so the pipelines that pass it keep running. `strict` wins
+   * when both are given.
+   */
   readonly allowFailure: boolean;
   readonly dryRun: boolean;
   readonly inject: boolean;
   /** Fatal problems, phrased for someone who is about to fix one. */
   readonly errors: string[];
+  /**
+   * The ones in `errors` that are mistakes in how the command was written, rather than in what
+   * this run's environment handed it: a number that is not one, a header with no colon, a host
+   * that is not a URL. They fail the same way on every run, so they fail under every setting.
+   */
+  readonly usage: string[];
   /** Worth saying, not worth stopping for. */
   readonly warnings: string[];
 }
@@ -58,7 +75,12 @@ const CONTROL = new RegExp('[\\u0000-\\u001f\\u007f]');
 
 export function resolve(sources: Sources): Resolved {
   const errors: string[] = [];
+  const usage: string[] = [];
   const warnings: string[] = [];
+  const misuse = (message: string): void => {
+    errors.push(message);
+    usage.push(message);
+  };
 
   const text = (flag: string, ...names: string[]): string => {
     const value = sources.flags.get(flag);
@@ -83,10 +105,10 @@ export function resolve(sources: Sources): Resolved {
   try {
     const parsed = new URL(host);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      errors.push(`The host must be http or https, not "${parsed.protocol.replace(':', '')}".`);
+      misuse(`The host must be http or https, not "${parsed.protocol.replace(':', '')}".`);
     }
   } catch {
-    errors.push(`"${host}" is not a URL. Pass --host like https://in.vinktar.com.`);
+    misuse(`"${host}" is not a URL. Pass --host like https://in.vinktar.com.`);
   }
 
   /**
@@ -119,10 +141,11 @@ export function resolve(sources: Sources): Resolved {
     release,
     dist,
     urlPrefix: text('url-prefix', 'VINKTAR_URL_PREFIX') || '~/',
-    concurrency: count(text('concurrency', 'VINKTAR_UPLOAD_CONCURRENCY'), 'concurrency', 1, 32, errors),
-    timeoutMs: count(text('timeout', 'VINKTAR_HTTP_TIMEOUT'), 'timeout', 1, 3_600, errors, 1_000),
-    maxRetries: count(text('retries', 'VINKTAR_HTTP_MAX_RETRIES'), 'retries', 1, 10, errors),
-    headers: headersFrom(sources.repeated.get('header') ?? [], errors),
+    concurrency: count(text('concurrency', 'VINKTAR_UPLOAD_CONCURRENCY'), 'concurrency', 1, 32, misuse),
+    timeoutMs: count(text('timeout', 'VINKTAR_HTTP_TIMEOUT'), 'timeout', 1, 3_600, misuse, 1_000),
+    maxRetries: count(text('retries', 'VINKTAR_HTTP_MAX_RETRIES'), 'retries', 1, 10, misuse),
+    deadlineMs: count(text('deadline', 'VINKTAR_UPLOAD_DEADLINE'), 'deadline', 1, 86_400, misuse, 1_000),
+    headers: headersFrom(sources.repeated.get('header') ?? [], misuse),
     ignore,
     extensions: extensionsFrom(text('ext', 'VINKTAR_EXTENSIONS')),
     rewriteSources: sources.flags.get('no-rewrite-sources') !== true,
@@ -135,6 +158,7 @@ export function resolve(sources: Sources): Resolved {
     dryRun: sources.flags.get('dry-run') === true,
     inject: sources.flags.get('no-inject') !== true,
     errors,
+    usage,
     warnings,
   };
 }
@@ -175,14 +199,14 @@ function count(
   option: string,
   min: number,
   max: number,
-  errors: string[],
+  refuse: (message: string) => void,
   scale = 1,
 ): number | undefined {
   if (value === '') return undefined;
 
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
-    errors.push(`--${option} must be a whole number between ${min} and ${max}, not "${value}".`);
+    refuse(`--${option} must be a whole number between ${min} and ${max}, not "${value}".`);
 
     return undefined;
   }
@@ -197,13 +221,13 @@ function count(
  * displace it: the flag exists for a gateway in front of ingest, not to smuggle a second identity
  * past the one the rest of the CLI validated.
  */
-function headersFrom(values: readonly string[], errors: string[]): Record<string, string> {
+function headersFrom(values: readonly string[], refuse: (message: string) => void): Record<string, string> {
   const found: Record<string, string> = {};
 
   for (const value of values) {
     const colon = value.indexOf(':');
     if (colon <= 0) {
-      errors.push(`--header "${value}" is not "Name: value".`);
+      refuse(`--header "${value}" is not "Name: value".`);
       continue;
     }
     found[value.slice(0, colon).trim()] = value.slice(colon + 1).trim();

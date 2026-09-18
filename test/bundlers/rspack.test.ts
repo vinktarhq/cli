@@ -1,7 +1,8 @@
+import { createServer, type Server } from 'node:http';
 import { mkdtemp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { existingDebugId, REGISTRY_GLOBAL } from '../../src/debug-id.js';
 import { vinktarRspack } from '../../src/bundler/rspack.js';
@@ -26,6 +27,26 @@ async function project(): Promise<string> {
   );
 
   return dir;
+}
+
+/**
+ * An ingest that answers 500 to everything, which is what an outage looks like from a build.
+ */
+async function down(): Promise<{ host: string; close(): Promise<void> }> {
+  const server: Server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => response.writeHead(500).end('{}'));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  return {
+    host: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
 }
 
 async function build(root: string, out: string, stamped: boolean): Promise<string> {
@@ -112,5 +133,60 @@ describe('the rspack plugin', () => {
     // would match while the bytes differed — the state that makes a service worker serve a stale
     // chunk forever.
     expect(await names('hwith', true)).not.toEqual(await names('hwithout', false));
+  });
+});
+
+describe('an rspack build while ingest is down', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const compile = async (root: string, host: string, strict: boolean): Promise<string> => {
+    const { rspack } = await import('@rspack/core');
+    const path = join(root, 'dist');
+
+    await new Promise<void>((resolve, reject) => {
+      rspack(
+        {
+          mode: 'production',
+          entry: join(root, 'src/main.js'),
+          devtool: 'hidden-source-map',
+          output: { path, filename: 'main.js' },
+          plugins: [new vinktarRspack({ key: 'vnk_sk_cli', host, release: 'r1', silent: true, strict })],
+        },
+        (error, stats) => {
+          if (error) return reject(error);
+          if (stats?.hasErrors() === true) return reject(new Error(stats.toString()));
+          resolve();
+        },
+      );
+    });
+
+    return path;
+  };
+
+  it('finishes, with the maps still in the output and a warning', async () => {
+    const server = await down();
+    const warnings: string[] = [];
+    vi.spyOn(console, 'warn').mockImplementation((line: string) => void warnings.push(line));
+
+    let path: string;
+    try {
+      path = await compile(await project(), server.host, false);
+    } finally {
+      await server.close();
+    }
+
+    expect((await readdir(path)).sort()).toEqual(['main.js', 'main.js.map']);
+    expect(warnings.join('\n')).toContain('source-map upload failed');
+  });
+
+  it('fails when strict asks for that', async () => {
+    const server = await down();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await expect(compile(await project(), server.host, true)).rejects.toThrow(/source-map upload failed/);
+    } finally {
+      await server.close();
+    }
   });
 });

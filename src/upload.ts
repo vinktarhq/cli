@@ -5,7 +5,7 @@ import { gzipSync } from 'node:zlib';
 
 import { deriveDebugId, existingDebugId, injectIntoMap, mapDebugId } from './debug-id.js';
 import { isEmptyMap, type Artifact } from './discover.js';
-import { backoffMs, RETRIABLE_STATUS, retriable, send as request, timeoutFor } from './http.js';
+import { backoffMs, reason, RETRIABLE_STATUS, retriable, send as request, timeoutFor } from './http.js';
 import {
   CONSERVATIVE_BATCH_BYTES,
   DEFAULT_HOST,
@@ -37,6 +37,15 @@ export interface UploadOptions {
   concurrency?: number;
   /** Attempts per request, including the first. Default 3. */
   maxRetries?: number;
+  /**
+   * For the whole upload, pre-flight and every batch and retry included. Default 5 minutes.
+   *
+   * The per-request numbers above do not add up to a bound: forty batches against a server that
+   * answers slowly is forty timeouts, three times over, and the CI job waits for all of them.
+   */
+  deadlineMs?: number;
+  /** Abandons the upload when it fires. The upload rejects with the signal's reason. */
+  signal?: AbortSignal;
   /** Extra headers, for a gateway that wants one. Never allowed to displace the key. */
   headers?: Readonly<Record<string, string>>;
   /** Appended to the User-Agent, so an ingest log can tell a plugin from a CI script. */
@@ -259,6 +268,7 @@ export async function preflight(options: UploadOptions, hashes: readonly string[
       headers: { 'Content-Type': 'application/json', ...options.headers },
       body: JSON.stringify({ sha256: hashes }),
       timeoutMs: options.timeoutMs ?? REQUEST_TIMEOUT_MS,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(options.plugin === undefined ? {} : { plugin: options.plugin }),
       ...(options.env === undefined ? {} : { env: options.env }),
     });
@@ -368,16 +378,21 @@ export async function send(
         headers: { 'Content-Type': contentType, ...options.headers },
         body,
         timeoutMs: timeoutFor(body.length, options.timeoutMs ?? REQUEST_TIMEOUT_MS),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
         ...(options.plugin === undefined ? {} : { plugin: options.plugin }),
         ...(options.env === undefined ? {} : { env: options.env }),
       });
     } catch (error) {
+      // Given up on, not failed: the deadline passed or another batch settled the outcome, and
+      // the reason on the signal is the thing to report. Retrying would be arguing with it.
+      if (options.signal?.aborted === true) throw options.signal.reason;
+
       if (attempt < attempts - 1 && retriable(error, isDefaultHost)) {
-        await sleep(backoffMs(attempt));
+        await sleep(backoffMs(attempt), options.signal);
         continue;
       }
       throw new UploadError(
-        `Could not reach ${options.host}${attempt > 0 ? ` after ${attempt + 1} attempts` : ''}: ${error instanceof Error ? error.message : String(error)}`,
+        `Could not reach ${options.host}${attempt > 0 ? ` after ${attempt + 1} attempts` : ''}: ${reason(error)}`,
         0,
         'network',
         'Check the host and that the machine running this can reach it.',
@@ -399,7 +414,7 @@ export async function send(
     }
 
     if (RETRIABLE_STATUS.has(reply.status) && attempt < attempts - 1) {
-      await sleep(backoffMs(attempt, reply.header('retry-after')));
+      await sleep(backoffMs(attempt, reply.header('retry-after')), options.signal);
       continue;
     }
 
@@ -411,8 +426,34 @@ export async function send(
 const MAX_ATTEMPTS = 3;
 const REQUEST_TIMEOUT_MS = 30_000;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Five minutes for everything. A deploy that waits longer than that for its source maps is stuck. */
+export const DEFAULT_DEADLINE_MS = 300_000;
+
+/** What an upload rejects with when {@link UploadOptions.deadlineMs} runs out. */
+export function deadlineError(deadlineMs: number): UploadError {
+  return new UploadError(
+    `The upload did not finish within ${seconds(deadlineMs)} and was abandoned.`,
+    0,
+    'deadline',
+    'Maps that had already gone up are stored. Raise --deadline (or $VINKTAR_UPLOAD_DEADLINE, or the deadlineMs option) if the build is simply large.',
+  );
+}
+
+/** Wait, unless the upload is abandoned first: a `Retry-After` of a minute must not outlive it. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted === true) return reject(signal.reason);
+
+    const abandon = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abandon);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', abandon, { once: true });
+  });
 }
 
 /**
@@ -558,29 +599,55 @@ export function batch<T extends { readonly entry: UploadEntry }>(
  * Source maps are large and the server is usually far away, so a build of two hundred chunks spent
  * most of its upload waiting on a socket. Bounded rather than unbounded: an unbounded fan-out of
  * 6 MB requests is how a deploy step gets itself rate-limited.
+ *
+ * The first failure settles the outcome, so it also ends the run: the controller is aborted with
+ * that failure, which stops the work in flight if it is listening, and no runner takes another
+ * item. Without that the other runners carried on through the rest of the list, each batch with
+ * its own retries, while the job that was already going to fail waited for them. Aborting the
+ * controller from outside, as the upload's deadline does, ends the run the same way.
  */
 export async function pooled<T, R>(
   items: readonly T[],
   limit: number,
   work: (item: T, index: number) => Promise<R>,
+  controller: AbortController = new AbortController(),
 ): Promise<R[]> {
   const results: R[] = new Array<R>(items.length);
+  const { signal } = controller;
   let next = 0;
+  let failure: { error: unknown } | null = null;
 
   const runner = async (): Promise<void> => {
-    for (;;) {
+    while (!signal.aborted) {
       const i = next;
       next += 1;
       if (i >= items.length) return;
-      results[i] = await work(items[i]!, i);
+
+      try {
+        results[i] = await work(items[i]!, i);
+      } catch (error) {
+        failure ??= { error };
+        controller.abort(error);
+
+        return;
+      }
     }
   };
 
   await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, runner));
+
+  const failed = failure as { error: unknown } | null;
+  if (failed !== null) throw failed.error;
+  if (signal.aborted) throw signal.reason;
 
   return results;
 }
 
 export function mb(bytes: number): string {
   return `${(bytes / 1_048_576).toFixed(1)} MB`;
+}
+
+/** `300 s`, `0.2 s`: a duration as the flags take it. */
+export function seconds(ms: number): string {
+  return `${Number((ms / 1000).toFixed(1))} s`;
 }

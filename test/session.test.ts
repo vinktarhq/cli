@@ -23,7 +23,10 @@ async function build(files: Record<string, string> = {}): Promise<string> {
   return dir;
 }
 
-async function ingest(status = 201): Promise<{ host: string; requests: number; close(): Promise<void> }> {
+async function ingest(
+  status = 201,
+  error = 'boom',
+): Promise<{ host: string; requests: number; close(): Promise<void> }> {
   let requests = 0;
   const server: Server = createServer((request, response) => {
     request.resume();
@@ -36,7 +39,7 @@ async function ingest(status = 201): Promise<{ host: string; requests: number; c
       }
       requests += 1;
       response.writeHead(status, { 'content-type': 'application/json' });
-      response.end(JSON.stringify(status === 201 ? { stored: 1, artifacts: [] } : { error: 'boom' }));
+      response.end(JSON.stringify(status === 201 ? { stored: 1, artifacts: [] } : { error }));
     });
   });
 
@@ -165,57 +168,217 @@ describe('what a plugin does after the build', () => {
   });
 });
 
+/**
+ * The vendor being down, a revoked key, a checkout with no git: none of those is a reason for
+ * somebody's deploy to stop. Every one of them warns, keeps the maps where the bundler put them,
+ * and lets the build finish; `strict` is for a team that would rather it stopped.
+ */
 describe('when the upload fails', () => {
-  it('fails the build, because the maps were about to be deleted', async () => {
+  const failing = async (
+    options: Parameters<typeof session>[0],
+    env: Record<string, string | undefined> = {},
+    files: Record<string, string> = {},
+  ): Promise<{ dir: string; requests: number; outcome: unknown }> => {
     const server = await ingest(500);
+    const dir = await build(files);
+    capture();
+
+    try {
+      const run = session({ key: 'vnk_sk_cli', host: server.host, release: 'r1', silent: true, ...options }, env);
+      const outcome = await run.upload(dir).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await run.cleanup();
+
+      return { dir, requests: server.requests, outcome };
+    } finally {
+      await server.close();
+    }
+  };
+
+  it('warns and lets the build finish when the server answers 500', async () => {
+    const { outcome } = await failing({});
+
+    expect(outcome).toBeNull();
+    expect(warnings.join('\n')).toContain('source-map upload failed: Ingest rejected the upload (HTTP 500).');
+  });
+
+  it('leaves the maps where they are, and says that a deploy of that directory publishes them', async () => {
+    const { dir } = await failing({});
+
+    expect((await readdir(dir)).sort()).toEqual(['app.js', 'app.js.map']);
+    expect(await readFile(join(dir, 'app.js'), 'utf8')).toContain('sourceMappingURL');
+    expect(warnings.join('\n')).toContain('left in place');
+    expect(warnings.join('\n')).toContain(dir);
+    expect(warnings.join('\n')).toContain('strict');
+  });
+
+  it('does not mention the maps when they were being kept anyway', async () => {
+    const { dir } = await failing({ deleteSourcemapsAfterUpload: false });
+
+    expect(warnings.join('\n')).toContain('source-map upload failed');
+    expect(warnings.join('\n')).not.toContain('left in place');
+    expect((await readdir(dir)).sort()).toEqual(['app.js', 'app.js.map']);
+  });
+
+  it('warns with the hint when the key is refused', async () => {
+    const server = await ingest(401, 'invalid_api_key');
     const dir = await build();
+    capture();
+
+    try {
+      const run = session({ key: 'vnk_sk_revoked', host: server.host, release: 'r1', silent: true }, {});
+      await run.upload(dir);
+      await run.cleanup();
+    } finally {
+      await server.close();
+    }
+
+    expect(warnings.join('\n')).toContain('The write key was rejected.');
+    expect(warnings.join('\n')).toContain('VINKTAR_CLI_KEY');
+    expect((await readdir(dir)).sort()).toEqual(['app.js', 'app.js.map']);
+  });
+
+  it('warns when the host cannot be reached at all', async () => {
+    const dir = await build();
+    capture();
+
+    // A port that was listening a moment ago and is not now. One attempt, so the test does not
+    // sit through the backoff.
+    const gone = await ingest();
+    await gone.close();
+    const run = session({ key: 'vnk_sk_cli', host: gone.host, release: 'r1', silent: true, maxRetries: 1 }, {});
+    await run.upload(dir);
+    await run.cleanup();
+
+    expect(warnings.join('\n')).toContain(`Could not reach ${gone.host}`);
+    expect(warnings.join('\n')).toContain('ECONNREFUSED');
+    expect((await readdir(dir)).sort()).toEqual(['app.js', 'app.js.map']);
+  });
+
+  it('warns about an empty release before any request, rather than relaying the server', async () => {
+    const { dir, requests } = await failing({ release: ' ' });
+
+    expect(requests).toBe(0);
+    expect(warnings.join('\n')).toContain('source-map upload failed: There is no release');
+    expect(warnings.join('\n')).toContain('VINKTAR_RELEASE');
+    expect((await readdir(dir)).sort()).toEqual(['app.js', 'app.js.map']);
+  });
+
+  it('warns about a map that is not JSON', async () => {
+    const { dir, outcome, requests } = await failing({}, {}, { 'app.js.map': 'not a source map' });
+
+    expect(outcome).toBeNull();
+    expect(requests).toBe(0);
+    expect(warnings.join('\n')).toContain('source-map upload failed');
+    expect((await readdir(dir)).sort()).toEqual(['app.js', 'app.js.map']);
+  });
+
+  it('warns about a directory it cannot read', async () => {
+    const server = await ingest();
     capture();
 
     try {
       const run = session({ key: 'vnk_sk_cli', host: server.host, release: 'r1', silent: true }, {});
-      await expect(run.upload(dir)).rejects.toThrow(/could never be symbolicated/);
-    } finally {
-      await server.close();
-    }
-  }, 30_000);
-
-  it('only warns when the maps are being kept, because a later upload still resolves them', async () => {
-    const server = await ingest(500);
-    const dir = await build();
-    capture();
-
-    try {
-      const run = session(
-        { key: 'vnk_sk_cli', host: server.host, release: 'r1', silent: true, deleteSourcemapsAfterUpload: false },
-        {},
-      );
-      await run.upload(dir);
+      await run.upload(join(tmpdir(), 'vinktar-session-never-built'));
+      await run.cleanup();
     } finally {
       await server.close();
     }
 
     expect(warnings.join('\n')).toContain('source-map upload failed');
-    expect((await readdir(dir)).sort()).toEqual(['app.js', 'app.js.map']);
-  }, 30_000);
+  });
 
-  it('hands the error to errorHandler instead, when one is given', async () => {
-    const server = await ingest(500);
-    const dir = await build();
+  it('still removes the maps of an output that did upload', async () => {
+    // A client bundle that went up and an SSR bundle that did not: only the second one stays.
+    const good = await ingest();
+    const bad = await ingest(500);
+    const client = await build();
+    const ssr = await build();
     capture();
-    const seen: Error[] = [];
 
     try {
+      const run = session({ key: 'vnk_sk_cli', host: good.host, release: 'r1', silent: true }, {});
+      await run.upload(client);
+      await session({ key: 'vnk_sk_cli', host: bad.host, release: 'r1', silent: true }, {}).upload(ssr);
+      await run.cleanup();
+    } finally {
+      await good.close();
+      await bad.close();
+    }
+
+    expect(await readdir(client)).toEqual(['app.js']);
+    expect((await readdir(ssr)).sort()).toEqual(['app.js', 'app.js.map']);
+  });
+
+  it('fails the build under strict, with the reason and the hint', async () => {
+    const { dir, outcome } = await failing({ strict: true });
+
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain('source-map upload failed: Ingest rejected the upload (HTTP 500).');
+    expect((await readdir(dir)).sort()).toEqual(['app.js', 'app.js.map']);
+  });
+
+  it('reads strict from VINKTAR_STRICT, for a pipeline that cannot edit the config', async () => {
+    expect((await failing({}, { VINKTAR_STRICT: '1' })).outcome).toBeInstanceOf(Error);
+    expect((await failing({ strict: false }, { VINKTAR_STRICT: '1' })).outcome).toBeNull();
+  });
+
+  it('fails a strict build on an empty release and on a broken map too', async () => {
+    expect((await failing({ strict: true, release: '' })).outcome).toBeInstanceOf(Error);
+    expect((await failing({ strict: true }, {}, { 'app.js.map': 'not a source map' })).outcome).toBeInstanceOf(Error);
+  });
+
+  it('hands the error to errorHandler instead, when one is given, strict or not', async () => {
+    const seen: Error[] = [];
+    const { dir, outcome } = await failing({ strict: true, errorHandler: (e) => void seen.push(e) });
+
+    expect(outcome).toBeNull();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.message).toContain('HTTP 500');
+    expect((await readdir(dir)).sort()).toEqual(['app.js', 'app.js.map']);
+  });
+
+  it('lets errorHandler fail the build by throwing', async () => {
+    const { outcome } = await failing({
+      errorHandler: (error) => {
+        throw error;
+      },
+    });
+
+    expect(outcome).toBeInstanceOf(Error);
+  });
+});
+
+describe('request shaping from a plugin', () => {
+  it('passes the deadline through, so a server that never answers cannot hold the build', async () => {
+    const server: Server = createServer((request) => void request.resume());
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const dir = await build();
+    capture();
+
+    const started = Date.now();
+    try {
       const run = session(
-        { key: 'vnk_sk_cli', host: server.host, release: 'r1', silent: true, errorHandler: (e) => void seen.push(e) },
+        {
+          key: 'vnk_sk_cli',
+          host: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+          release: 'r1',
+          silent: true,
+          deadlineMs: 200,
+        },
         {},
       );
       await run.upload(dir);
     } finally {
-      await server.close();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
 
-    expect(seen).toHaveLength(1);
-  }, 30_000);
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(warnings.join('\n')).toContain('did not finish within');
+  });
 });
 
 describe('being switched off', () => {

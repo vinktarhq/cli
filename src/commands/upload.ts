@@ -2,7 +2,9 @@ import { discover, type Artifact, type DiscoverOptions } from '../discover.js';
 import { MAX_FILE_BYTES } from '../limits.js';
 import {
   batch,
+  deadlineError,
   DEFAULT_CONCURRENCY,
+  DEFAULT_DEADLINE_MS,
   index,
   materialise,
   mb,
@@ -89,12 +91,39 @@ export interface UploadCommandOptions extends UploadOptions, DiscoverOptions {
  *
  * A summary line is printed on every exit path, including a thrown one. A build step whose last
  * output is a stack trace tells you it failed and not what it had managed to do first.
+ *
+ * The whole of it runs against one deadline (`deadlineMs`, five minutes unless told otherwise).
+ * When that passes, the requests in flight are aborted, no further batch starts, and the upload
+ * rejects like any other failed one.
  */
 export async function upload(
   root: string,
   options: UploadCommandOptions,
   log: (line: string) => void,
   warn: (line: string) => void = log,
+): Promise<UploadSummary> {
+  const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(deadlineError(deadlineMs)), deadlineMs);
+  const forward = (): void => controller.abort(options.signal?.reason);
+
+  if (options.signal?.aborted === true) forward();
+  else options.signal?.addEventListener('abort', forward, { once: true });
+
+  try {
+    return await run(root, { ...options, signal: controller.signal }, log, warn, controller);
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener('abort', forward);
+  }
+}
+
+async function run(
+  root: string,
+  options: UploadCommandOptions,
+  log: (line: string) => void,
+  warn: (line: string) => void,
+  controller: AbortController,
 ): Promise<UploadSummary> {
   let injected = 0;
 
@@ -235,6 +264,9 @@ export async function upload(
       .map((item) => ({ map: item.artifact.map, chunk: item.artifact.file, sha256: item.entry.mapSha256 }));
 
   const { stored: already, limits } = await preflight(options, indexed.map((item) => item.entry.sha256));
+  // The pre-flight answers "none" to every failure, this one included, and an upload that has
+  // been abandoned must not read that as "send everything".
+  if (controller.signal.aborted) throw controller.signal.reason;
 
   // The server's own ceiling, which can be smaller than the protocol's: the same deployment
   // advertises a 20 MiB limit and a 2 MiB `upload_max_filesize`, and only one of those is true of
@@ -277,24 +309,30 @@ export async function upload(
   let count = 0;
 
   try {
-    const results = await pooled(groups, options.concurrency ?? limits?.concurrency ?? DEFAULT_CONCURRENCY, async (group) => {
-      // Bodies are read here, not held from the index pass: one batch's worth of maps is in memory
-      // at a time, whatever the size of the build.
-      const loaded = await Promise.all(
-        group.map(async (item) => ({ entry: item.entry, body: await materialise(item.artifact, options) })),
-      );
+    const results = await pooled(
+      groups,
+      options.concurrency ?? limits?.concurrency ?? DEFAULT_CONCURRENCY,
+      async (group) => {
+        // Bodies are read here, not held from the index pass: one batch's worth of maps is in
+        // memory at a time, whatever the size of the build.
+        const loaded = await Promise.all(
+          group.map(async (item) => ({ entry: item.entry, body: await materialise(item.artifact, options) })),
+        );
 
-      const result = await send(options, loaded, limits);
-      sent.push(...group);
-      done += 1;
-      if (groups.length > 1) log(`Uploaded ${done} of ${groups.length} batches.`);
+        const result = await send(options, loaded, limits);
+        sent.push(...group);
+        done += 1;
+        if (groups.length > 1) log(`Uploaded ${done} of ${groups.length} batches.`);
 
-      return result;
-    });
+        return result;
+      },
+      // The same controller the deadline aborts, so a refused batch stops the ones in flight too.
+      controller,
+    );
 
     count = results.reduce((total, result) => total + result.stored, 0);
   } catch (error) {
-    // Whatever did land is still on the server, and the caller may still delete those maps. The
+    // Whatever did land is still on the server, and the next run will find it there. The
     // summary says how far it got before saying why it stopped.
     summarise(log, {
       ...base,

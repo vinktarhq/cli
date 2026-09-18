@@ -308,12 +308,169 @@ describe('agent commands', () => {
   });
 });
 
+/**
+ * These commands run at a terminal with a person or an agent waiting, so they fail with exit 1 as
+ * they always did. What they must not do is wait for ever, or fail with two words.
+ */
+describe('agent commands on a bad network', () => {
+  let dir: string;
+  let credentials: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vinktar-agent-net-'));
+    credentials = join(dir, 'credentials.json');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const io = (extra: Record<string, unknown> = {}) => ({ log: () => {}, fail: () => {}, env: {}, credentials, ...extra });
+  const signedIn = async (url: string): Promise<void> => {
+    await save(
+      url,
+      {
+        clientId: 'vnk_client_test',
+        session: {
+          clientId: 'vnk_client_test',
+          accessToken: 'at_1',
+          refreshToken: 'rt_1',
+          expiresAt: Date.now() + 3_600_000,
+          tokenEndpoint: `${new URL(url).origin}/oauth/token`,
+          revocationEndpoint: null,
+          scope: 'mcp:read',
+        },
+      },
+      credentials,
+    );
+  };
+
+  /** Accepts every connection and never answers. */
+  const hanging = async (): Promise<{ url: string; close(): Promise<void> }> => {
+    const server = createServer((request) => void request.resume());
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+    return {
+      url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`,
+      close: () =>
+        new Promise<void>((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve());
+        }),
+    };
+  };
+
+  it('gives up on a call the server never answers, and names the server', async () => {
+    const server = await hanging();
+    await signedIn(server.url);
+
+    try {
+      const began = Date.now();
+      await expect(runAgent('status', ['status'], new Map([['mcp', server.url]]), io({ timeoutMs: 200 }))).rejects.toThrow(
+        /127\.0\.0\.1:\d+ did not answer within 0\.2 s/,
+      );
+      expect(Date.now() - began).toBeLessThan(3_000);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('gives up on a sign-in whose discovery never answers', async () => {
+    const server = await hanging();
+
+    try {
+      await expect(
+        runAgent('login', ['login'], new Map<string, string | boolean>([['mcp', server.url], ['no-browser', true]]), io({ timeoutMs: 200 })),
+      ).rejects.toThrow(/did not answer within/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('gives up on a refresh the token endpoint never answers', async () => {
+    const server = await hanging();
+    await signedIn(server.url);
+    const remembered = await load(server.url, credentials);
+    await save(server.url, { ...remembered, session: { ...remembered.session!, expiresAt: 0 } }, credentials);
+
+    try {
+      await expect(runAgent('status', ['status'], new Map([['mcp', server.url]]), io({ timeoutMs: 200 }))).rejects.toThrow(
+        /did not answer within/,
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('signs out locally even when revoking never answers', async () => {
+    const server = await hanging();
+    await signedIn(server.url);
+    const remembered = await load(server.url, credentials);
+    await save(
+      server.url,
+      { ...remembered, session: { ...remembered.session!, revocationEndpoint: `${new URL(server.url).origin}/oauth/revoke` } },
+      credentials,
+    );
+
+    try {
+      expect(await runAgent('logout', ['logout'], new Map([['mcp', server.url]]), io({ timeoutMs: 200 }))).toBe(0);
+      expect((await load(server.url, credentials)).session).toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  /** The address of a server that was listening a moment ago and is not now. */
+  const gone = async (): Promise<string> => {
+    const server = await hanging();
+    await server.close();
+
+    return server.url;
+  };
+
+  it('says which server it could not reach and why, not "fetch failed"', async () => {
+    const url = await gone();
+    await signedIn(url);
+
+    const failure = await runAgent('status', ['status'], new Map([['mcp', url]]), io()).catch((error: unknown) => error);
+
+    expect((failure as Error).message).toContain(`Could not reach ${new URL(url).host}`);
+    expect((failure as Error).message).toContain('ECONNREFUSED');
+    expect((failure as Error).message).not.toBe('fetch failed');
+  });
+
+  it('says the same on the way in, where the first request is discovery', async () => {
+    await expect(
+      runAgent('login', ['login'], new Map<string, string | boolean>([['mcp', await gone()], ['no-browser', true]]), io()),
+    ).rejects.toThrow(/Could not reach 127\.0\.0\.1:\d+: .*ECONNREFUSED/);
+  });
+
+  it('checks what it was asked before checking who is asking', async () => {
+    // Not signed in. A call with no tool is wrong whoever runs it, and "Not signed in" sends an
+    // agent off to a browser for an argument it left out.
+    const flags = new Map([['mcp', 'http://127.0.0.1:1/mcp']]);
+
+    await expect(runAgent('call', ['call'], flags, io())).rejects.toThrow('Name the tool');
+    await expect(runAgent('sql', ['sql'], flags, io())).rejects.toThrow('Give the query');
+    await expect(runAgent('call', ['call', 'get_schema', 'oops'], flags, io())).rejects.toThrow('key=value');
+    await expect(
+      runAgent('call', ['call', 'get_schema'], new Map([...flags, ['args', '{"limit":']]), io()),
+    ).rejects.toThrow('--args');
+    await expect(runAgent('call', ['call', 'get_schema'], flags, io())).rejects.toThrow('Run: vinktar login');
+  });
+});
+
 describe('toolArguments', () => {
   it('merges --args with key=value, key=value winning', () => {
     expect(toolArguments(['limit=5'], '{"limit":1,"series":[{"aggregation":"total"}]}')).toEqual({
       limit: 5,
       series: [{ aggregation: 'total' }],
     });
+  });
+
+  it('says what was wrong with --args, rather than where a JSON parser stopped', () => {
+    expect(() => toolArguments([], '{"limit": 10')).toThrow(/^--args is not valid JSON \(.+\)\. It takes one object, like --args '\{"limit":10\}'\.$/);
+    expect(() => toolArguments([], "{'limit': 10}")).toThrow('--args is not valid JSON');
   });
 
   it('refuses what is not key=value, and --args that is not an object', () => {

@@ -4,10 +4,11 @@ import { readFileSync } from 'node:fs';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { sep } from 'node:path';
 
-import { upload, type StoredMap } from '../commands/upload.js';
+import { upload, type StoredMap, type UploadSummary } from '../commands/upload.js';
 import { deriveDebugId, existingDebugId, inject } from '../debug-id.js';
 import { allFiles, discover } from '../discover.js';
 import { DEFAULT_HOST } from '../limits.js';
+import { UploadError, type UploadOptions } from '../upload.js';
 
 /**
  * Everything the bundler plugins share, with no bundler in it.
@@ -65,11 +66,30 @@ export interface BundlerOptions {
   /** The `cli`-scoped key. Defaults to `$VINKTAR_CLI_KEY`. */
   key?: string;
   /**
-   * What to do when the upload fails. Providing one makes every failure non-fatal: it is called,
-   * and the build carries on. Without one, a failed upload fails the build only when the maps are
-   * being deleted — see {@link Session.upload}.
+   * Fail the build when the upload fails. Default **false**, or `VINKTAR_STRICT=1`.
+   *
+   * Without it a failed upload is a warning: an outage here, a revoked key or a checkout with no
+   * git is not a reason for somebody's deploy to stop. The maps of a failed upload are left where
+   * the bundler wrote them, deletion or not, so a team whose output directory is published as it
+   * stands, and who would rather not ship than ship maps, wants this on.
+   */
+  strict?: boolean;
+  /**
+   * Called with the failure instead of the warning or the throw, `strict` or not. Throw from it to
+   * fail the build.
    */
   errorHandler?: (error: Error) => void;
+  /** Per request, in milliseconds, before the size allowance. Default 30 000, or `$VINKTAR_HTTP_TIMEOUT` in seconds. */
+  timeoutMs?: number;
+  /** Attempts per request, including the first. Default 3, or `$VINKTAR_HTTP_MAX_RETRIES`. */
+  maxRetries?: number;
+  /** Requests in flight. Default 4, or what the server asks for, or `$VINKTAR_UPLOAD_CONCURRENCY`. */
+  concurrency?: number;
+  /**
+   * For the whole upload, in milliseconds. Default 300 000, or `$VINKTAR_UPLOAD_DEADLINE` in
+   * seconds. When it passes the upload is abandoned and treated as any other failed one.
+   */
+  deadlineMs?: number;
   /** Suppress the plugin's own output. Warnings about lost symbolication are still printed. */
   silent?: boolean;
 }
@@ -118,9 +138,11 @@ export function stamp(code: string, options: { prepend?: boolean } = {}): Stampe
 export function disabled(options: BundlerOptions, env: Record<string, string | undefined> = process.env): boolean {
   if (options.disable === true) return true;
 
-  const value = (env['VINKTAR_DISABLE'] ?? '').trim().toLowerCase();
+  return truthy(env['VINKTAR_DISABLE']);
+}
 
-  return ['1', 'true', 'yes', 'on'].includes(value);
+function truthy(value: string | undefined): boolean {
+  return ['1', 'true', 'yes', 'on'].includes((value ?? '').trim().toLowerCase());
 }
 
 /**
@@ -188,12 +210,55 @@ export function session(options: BundlerOptions, env: Record<string, string | un
   // takes this path and warns, instead of quietly deciding the user meant to skip it.
   const wantsUpload = options.uploadSourcemaps !== false;
   // Deletion is the second half of uploading, so switching the upload off switches it off too.
-  // Everything else — no key, a failed request — still deletes: the maps are the application's
-  // source sitting in a directory that is about to be served, and that is true either way.
+  // A build with no key still deletes: the maps are the application's source sitting in a
+  // directory that is about to be served. A FAILED upload does not — see `failed` below.
   const wantsDelete = options.deleteSourcemapsAfterUpload ?? wantsUpload;
+  const strict = options.strict ?? truthy(env['VINKTAR_STRICT']);
 
-  /** Per directory: the maps confirmed on the server, or `null` when nothing was uploaded. */
+  /**
+   * Per directory: the maps confirmed on the server, or `null` when no upload was attempted. A
+   * directory whose upload failed is not in here at all, so `cleanup` never visits it.
+   */
   const seen = new Map<string, StoredMap[] | null>();
+
+  /**
+   * An upload was attempted and did not work. Never fatal unless somebody asked for that.
+   *
+   * This runs inside somebody else's build, and the only thing it can honestly break is their
+   * deploy: the application is fine, it is this vendor, this key or this checkout that is not. So
+   * it warns, with the same message and hint the CLI prints, and the build finishes.
+   *
+   * The maps stay. Deleting them is the last step of a successful upload, and there was not one:
+   * these are the only copy, and the next run (or `sourcemaps upload` on the same directory) can
+   * still send them. It does mean the output directory holds the application's source, which is
+   * said in so many words, because a deploy that publishes that directory publishes them.
+   */
+  const failed = (outDir: string, failure: Error): void => {
+    seen.delete(outDir);
+
+    const message = /[.!?]$/.test(failure.message) ? failure.message : `${failure.message}.`;
+    const hint = failure instanceof UploadError && failure.hint !== undefined ? ` ${failure.hint}` : '';
+    const kept = wantsDelete
+      ? ` The source maps were left in place in ${outDir}, and a deploy that publishes that directory publishes them.`
+      : '';
+
+    if (options.errorHandler !== undefined) {
+      options.errorHandler(failure);
+      if (kept !== '') warn(kept.trim());
+
+      return;
+    }
+
+    if (strict) {
+      throw new Error(`source-map upload failed: ${message}${hint}`, { cause: failure });
+    }
+
+    warn(`source-map upload failed: ${message}${hint}`);
+    warn(
+      `The build carries on, and errors from this release keep their minified stack traces.${kept} ` +
+        'Set strict: true, or VINKTAR_STRICT=1, to fail the build instead.',
+    );
+  };
 
   let announced = false;
 
@@ -226,48 +291,47 @@ export function session(options: BundlerOptions, env: Record<string, string | un
         return;
       }
 
+      let summary: UploadSummary;
       try {
-        const summary = await upload(
+        const release = (options.release ?? detectRelease(env)).trim();
+        // Checked here, before anything is sent. Detection comes back empty on a machine with no
+        // CI variables and no git (a Docker build stage, usually), and the server's answer to an
+        // empty release is `missing_release` with a hint about flags this plugin does not have.
+        if (release === '') {
+          throw new UploadError(
+            'There is no release to file the maps under.',
+            0,
+            'missing_release',
+            'None was given, no CI commit variable is set, and git found no commit here. Pass `release`, or set VINKTAR_RELEASE, to the value your SDK reports.',
+          );
+        }
+
+        summary = await upload(
           outDir,
           {
             host: (options.host ?? env['VINKTAR_HOST'] ?? DEFAULT_HOST).replace(/\/+$/, ''),
             key,
-            release: options.release ?? detectRelease(env),
+            release,
             ...(options.dist === undefined || options.dist === '' ? {} : { dist: options.dist }),
             urlPrefix: options.urlPrefix ?? '~/',
             dryRun: false,
             // The chunks were stamped as they were rendered; a second pass would re-read every
             // file in the build and change nothing.
             inject: false,
+            ...shaping(options, env, warn),
           },
           log,
           warn,
         );
-
-        seen.set(outDir, summary.storedMaps.slice());
       } catch (error) {
-        const failure = error instanceof Error ? error : new Error(String(error));
-        seen.set(outDir, null);
+        // Everything, not only what the server said: a map that is not JSON and a directory that
+        // cannot be read throw from the same call, and cost the build exactly as much.
+        failed(outDir, error instanceof Error ? error : new Error(String(error)));
 
-        if (options.errorHandler !== undefined) {
-          options.errorHandler(failure);
-
-          return;
-        }
-
-        // Fatal only when the maps are about to be deleted. Otherwise a later upload of the same
-        // artifacts still resolves these frames — debug ids do not expire — and failing a deploy
-        // over a brief network problem is the worse trade. With deletion on that reasoning dies
-        // with the maps: there is no second chance, so the build stops here.
-        if (wantsDelete) {
-          throw new Error(
-            `source-map upload failed, and deleteSourcemapsAfterUpload is on, so this release could never be symbolicated: ${failure.message}`,
-            { cause: failure },
-          );
-        }
-
-        warn(`source-map upload failed: ${failure.message}`);
+        return;
       }
+
+      seen.set(outDir, summary.storedMaps.slice());
     },
 
     async cleanup(): Promise<void> {
@@ -280,6 +344,42 @@ export function session(options: BundlerOptions, env: Record<string, string | un
       seen.clear();
     },
   };
+}
+
+/**
+ * Timeout, retries, concurrency and deadline: the option, then the variable the CLI reads.
+ *
+ * The variables are in seconds where the CLI's flags are, so one pipeline setting means the same
+ * thing to both. A value that is not a positive whole number is ignored with a warning rather than
+ * refused: a typo in a CI variable is not worth a build either.
+ */
+function shaping(
+  options: BundlerOptions,
+  env: Record<string, string | undefined>,
+  warn: (line: string) => void,
+): Pick<UploadOptions, 'timeoutMs' | 'maxRetries' | 'concurrency' | 'deadlineMs'> {
+  const read = (given: number | undefined, name: string, scale: number): number | undefined => {
+    if (given !== undefined) return given;
+
+    const raw = (env[name] ?? '').trim();
+    if (raw === '') return undefined;
+
+    const parsed = Number(raw);
+    if (Number.isInteger(parsed) && parsed > 0) return parsed * scale;
+
+    warn(`${name} is "${raw}", which is not a whole number above zero; using the default.`);
+
+    return undefined;
+  };
+
+  const found = {
+    timeoutMs: read(options.timeoutMs, 'VINKTAR_HTTP_TIMEOUT', 1_000),
+    maxRetries: read(options.maxRetries, 'VINKTAR_HTTP_MAX_RETRIES', 1),
+    concurrency: read(options.concurrency, 'VINKTAR_UPLOAD_CONCURRENCY', 1),
+    deadlineMs: read(options.deadlineMs, 'VINKTAR_UPLOAD_DEADLINE', 1_000),
+  };
+
+  return Object.fromEntries(Object.entries(found).filter(([, value]) => value !== undefined));
 }
 
 /**
@@ -298,10 +398,11 @@ export async function finish(
 /**
  * Delete the maps under one directory, and unpoint the chunks that referenced them.
  *
- * `stored` names the maps the server confirmed; `null` means nothing was uploaded (no key, or a
- * failure the caller chose to survive) and every map goes, because the reason for deleting them —
- * they are the application's source, sitting in a public directory — has nothing to do with
- * whether an upload happened.
+ * `stored` names the maps the server confirmed; `null` means no upload was attempted (no key, or
+ * uploading switched off with deletion left on) and every map goes, because the reason for
+ * deleting them — they are the application's source, sitting in a public directory — has nothing
+ * to do with whether an upload happened. A directory whose upload was attempted and failed never
+ * gets here.
  *
  * A map whose bytes changed since it was indexed is left alone. Turbopack rewrites files while
  * later stages are still running, and deleting one there removes a map the server never got.

@@ -1,7 +1,8 @@
+import { createServer, type Server } from 'node:http';
 import { mkdtemp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { build, type Rollup } from 'vite';
 
 import { vinktar } from '../../src/vite.js';
@@ -16,6 +17,26 @@ import { existingDebugId, REGISTRY_GLOBAL } from '../../src/debug-id.js';
  * precache manifest, an integrity attribute, a precompressed copy — was pointing at content that
  * no longer existed. The only way to see that is to build.
  */
+
+/**
+ * An ingest that answers 500 to everything, which is what an outage looks like from a build.
+ */
+async function down(): Promise<{ host: string; close(): Promise<void> }> {
+  const server: Server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => response.writeHead(500).end('{}'));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  return {
+    host: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
 
 async function project(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'vinktar-vite-'));
@@ -253,3 +274,55 @@ function decodeFirst(group: string): number[] {
 
   return values;
 }
+
+describe('a vite build while ingest is down', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it(
+    'finishes, with the maps still in the output and a warning',
+    async () => {
+      const server = await down();
+      const lines: string[] = [];
+      vi.spyOn(console, 'warn').mockImplementation((line: string) => void lines.push(line));
+
+      let built: Built;
+      try {
+        built = await run(await project(), true, 'dist', {}, {
+          uploadSourcemaps: true,
+          key: 'vnk_sk_cli',
+          host: server.host,
+          release: 'r1',
+        });
+      } finally {
+        await server.close();
+      }
+
+      expect(built.maps.length).toBeGreaterThanOrEqual(2);
+      expect(lines.join('\n')).toContain('source-map upload failed');
+    },
+    60_000,
+  );
+
+  it(
+    'fails when strict asks for that',
+    async () => {
+      const server = await down();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        await expect(
+          run(await project(), true, 'dist', {}, {
+            uploadSourcemaps: true,
+            key: 'vnk_sk_cli',
+            host: server.host,
+            release: 'r1',
+            strict: true,
+          }),
+        ).rejects.toThrow(/source-map upload failed/);
+      } finally {
+        await server.close();
+      }
+    },
+    60_000,
+  );
+});

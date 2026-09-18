@@ -86,11 +86,16 @@ Behaviour
                       only; the file on disk is never touched.
   --dry-run           Print what would be uploaded, including the URL each map
                       will be stored under. Sends nothing, and needs no key.
-  --strict            Treat any warning as a failure (exit 2).
-  --allow-failure     Never exit non-zero because the upload failed.
+  --strict            Forgive nothing: a failed upload exits 1, and warnings from
+                      an upload or an inject that worked exit 2. Also
+                      $VINKTAR_STRICT=1. Wins over --allow-failure.
+  --allow-failure     Accepted and ignored. A failed upload exits 0 by default
+                      now; the flag stays so pipelines that pass it keep running.
   --concurrency <n>   Requests in flight. Default 4, or what the server asks.
   --timeout <s>       Per request, before the size allowance. Default 30.
   --retries <n>       Attempts per request, including the first. Default 3.
+  --deadline <s>      For the whole upload. Default 300. When it passes, what is
+                      left is abandoned and the upload counts as failed.
   --header <h>        "Name: value", for a gateway in front of ingest.
                       Repeatable. Cannot displace the key header.
   --dotenv-file <p>   Read VINKTAR_* from this file. Ranks below the real
@@ -102,6 +107,15 @@ Output
   --debug             Everything, with the key redacted.
   -h, --help          This.
   -v, --version       Print the version.
+
+Exit codes
+  0   Fine. For "sourcemaps upload" also: the upload failed, stderr says why
+      after "WARNING: source maps were not uploaded.", and the deploy goes on.
+  1   It did not work. "sourcemaps upload" only says so under --strict; every
+      other command always does. A command that was written wrong (an unknown
+      command, a value that does not parse) is 1 with or without it. An unknown
+      flag is too, except on "sourcemaps upload" without --strict, which warns.
+  2   It worked, and --strict found warnings.
 
 Typical use, in a deploy script:
 
@@ -134,6 +148,46 @@ const BOOLEAN_FLAGS = new Set([
   'version',
   'v',
 ]);
+
+/**
+ * Every flag that takes a value. With the switches above, this is every flag there is.
+ *
+ * Kept as a list so that a flag nobody has heard of can be refused. It mattered less while a
+ * failed upload failed the job: now that it does not, `--strcit` would be a pipeline that believes
+ * it is strict and is not, and nothing would ever say so.
+ */
+const VALUE_FLAGS = new Set([
+  'key',
+  'release',
+  'dist',
+  'host',
+  'url-prefix',
+  'ignore',
+  'ext',
+  'concurrency',
+  'timeout',
+  'retries',
+  'deadline',
+  'header',
+  'dotenv-file',
+  'dir',
+  'line',
+  'column',
+  'project',
+  'mcp',
+  'args',
+  'last',
+  'write',
+]);
+
+/** Switches that can also be turned off, over a variable that turned them on. */
+const NEGATABLE = new Set(['strict', 'allow-failure', 'quiet', 'debug']);
+
+function known(name: string): boolean {
+  if (BOOLEAN_FLAGS.has(name) || VALUE_FLAGS.has(name)) return true;
+
+  return name.startsWith('no-') && NEGATABLE.has(name.slice('no-'.length));
+}
 
 export function parse(argv: readonly string[]): Args {
   const positional: string[] = [];
@@ -209,7 +263,22 @@ function text(flags: Args['flags'], name: string, fallback = ''): string {
  * Two rather than one for `--strict`, so a pipeline can tell "the upload failed" from "the upload
  * succeeded and half your chunks have no maps" — which are different problems with different
  * owners, and merging them means neither gets fixed.
+ *
+ * `sourcemaps upload` is the exception to 1, because it is the one command that runs inside
+ * somebody's deploy. Whatever stopped the maps going up — this vendor being down, a key that was
+ * revoked, a secret that was never wired, a directory that is not there — is not a reason for
+ * their release to stop, so it is said on stderr and the exit code is 0. `--strict` is how a team
+ * says it would rather stop: then the same failures are 1. A command that was written wrong is 1
+ * either way, since no run of it could have worked.
  */
+/** `--strict` or `VINKTAR_STRICT`, read before the configuration exists (a `--dotenv-file` is not consulted). */
+function strictRequested(flags: Args['flags']): boolean {
+  if (flags.get('strict') === true) return true;
+  if (flags.get('no-strict') === true) return false;
+
+  return ['1', 'true', 'yes', 'on'].includes((process.env['VINKTAR_STRICT'] ?? '').trim().toLowerCase());
+}
+
 export async function run(argv: readonly string[], log = console.log, fail = console.error): Promise<number> {
   const { positional, flags, repeated } = parse(argv);
 
@@ -227,6 +296,22 @@ export async function run(argv: readonly string[], log = console.log, fail = con
     return positional.length === 0 ? 1 : 0;
   }
 
+  const unknown = [...flags.keys()].filter((name) => !known(name));
+  if (unknown.length > 0) {
+    const named = unknown.map((name) => `--${name}`).join(', ');
+    // An upload runs inside somebody's deploy, and these flags used to be ignored: a stray one
+    // must not start failing a pipeline that worked yesterday. It is said out loud instead, and
+    // --strict, which forgives nothing, still refuses it.
+    const forgiven =
+      positional[0] === 'sourcemaps' && positional[1] === 'upload' && !strictRequested(flags);
+    if (!forgiven) {
+      fail(`Unknown flag ${named}. Try --help.`);
+
+      return 1;
+    }
+    fail(`WARNING: unknown flag ${named}, ignored. Try --help.`);
+  }
+
   // The agent commands share nothing with the source-map configuration: no key, no release, no
   // host. Dispatched before that configuration is resolved, so its errors cannot block them.
   if (AGENT_COMMANDS.has(positional[0]!)) {
@@ -241,11 +326,6 @@ export async function run(argv: readonly string[], log = console.log, fail = con
 
   const dotenvPath = text(flags, 'dotenv-file');
   const dotenv = dotenvPath === '' ? null : await loadDotEnv(dotenvPath);
-  if (dotenv !== null && !dotenv.found) {
-    fail(`No such file: ${dotenvPath}`);
-
-    return 1;
-  }
   for (const warning of dotenv?.warnings ?? []) fail(`WARNING: ${warning}`);
 
   const config = resolve({
@@ -255,8 +335,32 @@ export async function run(argv: readonly string[], log = console.log, fail = con
     ...(dotenv === null ? {} : { dotenv: dotenv.values }),
   });
 
-  for (const error of config.errors) fail(error);
-  if (config.errors.length > 0) return 1;
+  const uploading = positional[0] === 'sourcemaps' && positional[1] === 'upload';
+
+  /** The end of a run that did not work: what is printed, and what it costs. */
+  const failed = (lines: readonly string[], hints: readonly string[] = []): number => {
+    if (!uploading || config.strict) {
+      for (const line of [...lines, ...hints]) fail(line);
+
+      return 1;
+    }
+
+    // One fixed line first, so a log search finds every deploy that went out without its maps.
+    fail('WARNING: source maps were not uploaded.');
+    for (const line of [...lines, ...hints]) fail(line);
+    fail('Errors from this release will keep their minified stack traces until the maps are uploaded.');
+    fail('Exiting 0 so the deploy carries on. Pass --strict, or set VINKTAR_STRICT=1, to exit 1 instead.');
+
+    return 0;
+  };
+
+  if (config.usage.length > 0) {
+    for (const error of config.errors) fail(error);
+
+    return 1;
+  }
+  if (dotenv !== null && !dotenv.found) return failed([`No such file: ${dotenvPath}`]);
+  if (config.errors.length > 0) return failed(config.errors);
   for (const warning of config.warnings) fail(`WARNING: ${warning}`);
 
   const say = config.quiet ? (): void => {} : log;
@@ -279,7 +383,7 @@ export async function run(argv: readonly string[], log = console.log, fail = con
     if (directory === undefined) return missing('a directory', 'e.g. ./dist', fail);
 
     if (action === 'inject') return await runInject(directory, config, say, fail);
-    if (action === 'upload') return await runUpload(directory, config, say, fail, debug);
+    if (action === 'upload') return await runUpload(directory, config, say, fail, debug, failed);
 
     fail(`Unknown sourcemaps action "${action ?? ''}". Try inject, upload or resolve.`);
 
@@ -287,19 +391,24 @@ export async function run(argv: readonly string[], log = console.log, fail = con
   } catch (error) {
     if (error instanceof UploadError) {
       fail('');
-      fail(error.message);
-      if (error.hint !== undefined) fail(error.hint);
-      if (!config.debug) fail('Re-run with --debug for the full exchange.');
 
-      return config.allowFailure ? 0 : 1;
+      return failed(
+        [error.message],
+        [
+          ...(error.hint === undefined ? [] : [error.hint]),
+          ...(config.debug ? [] : ['Re-run with --debug for the full exchange.']),
+        ],
+      );
     }
 
-    fail(error instanceof Error ? error.message : String(error));
-    if (error instanceof Error && error.cause !== undefined) {
-      fail(`caused by: ${error.cause instanceof Error ? error.cause.message : String(error.cause)}`);
-    }
-
-    return 1;
+    // Not from the server: a map that is not JSON, a directory that cannot be read. Local, and
+    // for an upload just as much not the deploy's problem.
+    return failed([
+      error instanceof Error ? error.message : String(error),
+      ...(error instanceof Error && error.cause !== undefined
+        ? [`caused by: ${error.cause instanceof Error ? error.cause.message : String(error.cause)}`]
+        : []),
+    ]);
   }
 }
 
@@ -355,6 +464,7 @@ async function runUpload(
   log: (line: string) => void,
   fail: (line: string) => void,
   debug: (line: string) => void,
+  failed: (lines: readonly string[]) => number,
 ): Promise<number> {
   // Detected here rather than demanded, exactly as the plugins do: a deploy script that already
   // knows its commit should not have to say so twice. Announced when it was detected, because a
@@ -364,11 +474,13 @@ async function runUpload(
 
   // A dry run opens no socket, so it needs no key: "what would this upload" is the first thing
   // anyone asks, and needing a production secret to answer it is why nobody asked.
+  // Neither is a usage error. A key that is not there is a secret that was never wired into this
+  // job, and a release that is not there is a checkout with no git: both belong to the run.
   if (!config.dryRun && config.key === '') {
-    return missing('a key', '--key, $VINKTAR_CLI_KEY or $VINKTAR_KEY', fail);
+    return failed(['Missing a key. Pass --key, $VINKTAR_CLI_KEY or $VINKTAR_KEY.']);
   }
   if (!config.dryRun && release === '') {
-    return missing('a release', '--release or $VINKTAR_RELEASE, matching what your SDK reports', fail);
+    return failed(['Missing a release. Pass --release or $VINKTAR_RELEASE, matching what your SDK reports.']);
   }
 
   debug(`host ${config.host}, release ${release}, key ${config.key}`);
@@ -391,6 +503,7 @@ async function runUpload(
       ...(config.concurrency === undefined ? {} : { concurrency: config.concurrency }),
       ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
       ...(config.maxRetries === undefined ? {} : { maxRetries: config.maxRetries }),
+      ...(config.deadlineMs === undefined ? {} : { deadlineMs: config.deadlineMs }),
       ...(Object.keys(config.headers).length === 0 ? {} : { headers: config.headers }),
     },
     log,
@@ -405,9 +518,8 @@ async function runUpload(
   const found = summary.uploaded + summary.alreadyStored + summary.oversized;
   if (found === 0 && !config.dryRun) {
     log('');
-    log('No source maps found. Run your bundler with source maps enabled first.');
 
-    return config.allowFailure ? 0 : 1;
+    return failed(['No source maps found. Run your bundler with source maps enabled first.']);
   }
 
   if (!config.dryRun) {
@@ -474,6 +586,36 @@ function missing(what: string, how: string, fail: (line: string) => void): numbe
   fail(`Missing ${what}. Pass ${how}.`);
 
   return 1;
+}
+
+/**
+ * What the executable does with an error on stdout or stderr.
+ *
+ * A closed pipe is not an error: `vinktar sourcemaps upload ./dist | head` closes stdout while
+ * this is still writing, and the default handler turns that into an unhandled `EPIPE` and a
+ * non-zero exit, so a deploy step that pipes the output into anything at all fails for reading its
+ * own logs. Anything else is real, and gets a line and an exit code rather than being rethrown
+ * from inside an event handler, which prints a stack trace of Node's stream internals.
+ */
+export function streamFailed(
+  error: NodeJS.ErrnoException,
+  report: (line: string) => void = console.error,
+  target: { exitCode?: typeof process.exitCode } = process,
+): void {
+  if (error.code === 'EPIPE') return;
+
+  target.exitCode = 1;
+  report(`vinktar: could not write output: ${error.message}`);
+}
+
+/** Anything that escaped `run`'s own handling. One line, because the stack is never the interesting part. */
+export function escaped(
+  error: unknown,
+  report: (line: string) => void = console.error,
+  target: { exitCode?: typeof process.exitCode } = process,
+): void {
+  target.exitCode = 1;
+  report(`vinktar: ${error instanceof Error ? error.message : String(error)}`);
 }
 
 export { VERSION };
