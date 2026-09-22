@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+### Chunks that bundle the browser SDK get their debug id registered
+
+A chunk with `@vinktarhq/browser` inside it was stamped with the `//# debugId=` comment but not the
+runtime registration, because the SDK's own reference to `_vinktarDebugIds` looked like one. Errors
+from that chunk reached the server without a debug id, and where the CDN rewrites the path, as
+Shopify does for theme extension assets, nothing else could match them to their map. Rebuild with
+0.3.1 and those frames resolve.
+
 ## 0.3.0
 
 ### A failed upload no longer fails your build

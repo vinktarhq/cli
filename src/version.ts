@@ -7,4 +7,4 @@
  * A test asserts it matches `package.json`, and `prepublishOnly` runs that test — reading the
  * manifest at runtime instead would mean resolving a path that moves between `src` and `dist`.
  */
-export const VERSION = '0.3.0';
+export const VERSION = '0.3.1';

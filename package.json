@@ -1,6 +1,6 @@
 {
   "name": "@vinktarhq/cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Vinktar CLI: upload source maps, and reach Vinktar from coding agents that have no MCP support.",
   "keywords": [
     "vinktar",
