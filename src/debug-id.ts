@@ -139,9 +139,16 @@ export function commentDebugId(code: string): string | null {
   return value === undefined || value === '' ? null : value;
 }
 
-/** Whether the chunk carries the runtime registration, as opposed to merely a comment about it. */
+/** A registration written before the marker existed: a uuid assigned into the registry. */
+const LEGACY_REGISTRATION = new RegExp(`\\.${REGISTRY_GLOBAL}\\[[^\\]]+\\]\\s*=\\s*["'][0-9a-fA-F-]{36}["']`);
+
+/**
+ * Whether the chunk carries the runtime registration, as opposed to merely a comment about it.
+ * Matched on the registration itself: the browser SDK names the registry to read it, and a chunk
+ * that bundles the SDK is exactly the one that needs registering.
+ */
 export function hasSnippet(code: string): boolean {
-  return code.includes(REGISTRY_GLOBAL);
+  return MARKER.test(code) || LEGACY_REGISTRATION.test(code);
 }
 
 /**

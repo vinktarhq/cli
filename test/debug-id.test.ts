@@ -53,6 +53,14 @@ describe('inject', () => {
     expect(snippetCount(twice)).toBe(1);
   });
 
+  it('still registers a chunk that bundles the browser SDK, which names the registry itself', () => {
+    const withSdk = `const REGISTRY_GLOBAL = '${REGISTRY_GLOBAL}';\nfunction debugIdFor(f) { return globalThis[REGISTRY_GLOBAL]; }\n`;
+    const { code } = inject(withSdk, ID);
+
+    expect(snippetCount(code)).toBe(1);
+    expect(code).toContain(`${MARKER_GLOBAL}="vinktar-dbid-${ID}"`);
+  });
+
   it('reports no id for an un-injected chunk', () => {
     expect(existingDebugId('const a = 1;')).toBeNull();
   });
