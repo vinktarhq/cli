@@ -10,6 +10,8 @@ Makes your production stack traces resolve to the code you wrote instead of a mi
 Add one plugin to your bundler. On every build it stamps each chunk with a debug id, uploads the
 source maps to Vinktar, and deletes them from the output so they are never served to users.
 
+The setup guide, and how to check that data arrives: [vinktar.com/docs/install/cli](https://vinktar.com/docs/install/cli).
+
 ```ts
 // vite.config.ts
 import { vinktar } from '@vinktarhq/cli/vite';
